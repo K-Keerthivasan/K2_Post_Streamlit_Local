@@ -8,9 +8,6 @@ services:
       - .env
     environment:
       OLLAMA_BASE_URL: "http://host.docker.internal:11434/v1"
-      # Inside the container, localhost is the container — reach host-run Postiz
-      # via host.docker.internal. (Host CLI keeps using config.yaml's localhost.)
-      POSTIZ_BASE_URL: "http://host.docker.internal:4007/api/public/v1"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

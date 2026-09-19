@@ -113,35 +113,6 @@ def render_slide_to_bytes(
         tmp.unlink(missing_ok=True)
 
 
-def render_overlay_to_bytes(
-    template_name: str,
-    variables: dict,
-    width: int = 1080,
-    height: int = 1920,
-) -> bytes:
-    """Render an overlay template to a TRANSPARENT PNG (video_reels card frames).
-
-    The template's body must be ``background:transparent``; Playwright's
-    ``omit_background`` then keeps everything that isn't painted see-through, so
-    ffmpeg can composite the bars/text over the source clip.
-    """
-    env = Environment(loader=FileSystemLoader("templates"))
-    tmpl = env.get_template(template_name)
-    html = tmpl.render(**variables)
-    tmp = _write_temp_html(html)
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch()
-            ctx = browser.new_context(viewport={"width": width, "height": height})
-            page = ctx.new_page()
-            page.goto(tmp.as_uri(), wait_until="networkidle")
-            png = page.screenshot(type="png", omit_background=True)
-            browser.close()
-        return png
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
 # ── full carousel ────────────────────────────────────────────────────────────
 
 def generate_carousel(plan: dict, image_paths: dict | None = None,

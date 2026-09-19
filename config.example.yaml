@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Example configuration. Copy this file to `config.yaml` and edit it with your
-# own brand(s), feeds, and Postiz channels. `config.yaml` is gitignored so your
+# own brand(s), feeds, and Meta accounts. `config.yaml` is gitignored so your
 # real details never get committed. The app auto-copies this file to config.yaml
 # on first run if one doesn't exist.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -11,35 +11,49 @@ app:
 # Which brand the app is currently posting for. Switch in the header dropdown.
 active_brand: demo
 
-# ── Postiz publisher ────────────────────────────────────────────────────────────
-# Pushes finished assets to a self-hosted/hosted Postiz instance → Instagram.
-# The API key is read from the env var named below (never hard-code it).
-postiz:
-  # base_url = your Postiz NEXT_PUBLIC_BACKEND_URL + "/public/v1".
-  # Local Docker (default compose, frontend on :4007):  http://localhost:4007/api/public/v1
-  # Hosted Postiz cloud:                                 https://api.postiz.com/public/v1
-  base_url: "http://localhost:4007/api/public/v1"
-  api_key_env: "POSTIZ_API_KEY"          # set this in .env (Postiz → Settings → Public API)
-  channels:
-    # Map each brand key (under `brands:`) to its Postiz Instagram integration.
-    # Get the id/name from: python postiz.py --list-channels
-    demo: "your-integration-id-or-name"
+# ── Publishing: Instagram + Facebook via the Meta Graph API ───────────────────
+# Direct publishing with your own Meta credentials. Engine + CLI: meta.py.
+# Check your setup any time with:  python meta.py --verify
+#
+# You need a Meta app with the Instagram Graph API product, an Instagram
+# Business/Creator account linked to a Facebook Page, and a long-lived token with
+# instagram_basic, instagram_content_publish, pages_show_list,
+# pages_read_engagement and pages_manage_posts. Put the token in .env as
+# META_ACCESS_TOKEN — never in this file.
+#
+# Instagram also needs PUBLIC_BASE_URL in .env: Meta fetches the rendered images
+# from your machine, so a localhost address can never work.
+meta:
+  api_version: "v21.0"
+  token_env: "META_ACCESS_TOKEN"     # global default; override per account below
+  accounts:
+    # One entry per brand key under `brands:` below.
+    demo:
+      ig_user_id: ""                 # Instagram Business account id, not the @handle
+      fb_page_id: ""                 # linked Facebook Page id (optional)
+      targets: ["instagram"]         # instagram | facebook | both
+      # login: instagram             # set when the token came from Instagram
+                                     # business login (graph.instagram.com).
+                                     # Omit for Graph API Explorer / FB Login
+                                     # tokens - each host rejects the other's.
+      # token_env: "META_ACCESS_TOKEN_DEMO"   # per-brand token, if they differ
   publish:
-    default_mode: "draft"        # draft | schedule | now
-    allow_now: false             # hard guard: refuse mode "now" unless explicitly true
+    default_targets: ["instagram"]
+    on_approve: "hold"           # hold = approve then schedule/publish yourself
+                                 # now  = approving publishes immediately
+    allow_now: true
   rate_limit:
-    max_requests_per_hour: 30
+    max_posts_per_day: 25        # Instagram's own 24h ceiling
     safety_margin: 2
-  reel:
-    require_9x16: true
-    min_seconds: 5
-    max_seconds: 90
 
-# ── Video Reels mode (YouTube trailer → branded 9:16 carousel/reel) ─────────────
-video_reels:
-  default_clip_seconds: 4.0
-  scene_threshold: 0.4
-  allowlist: []                  # cleared YouTube channel_ids / RSS urls / video urls
+# ── Post calendar ─────────────────────────────────────────────────────────────
+# Slots the Calendar tab auto-fill uses, plus the background publisher that sends
+# a scheduled post when its time arrives. Local time.
+schedule:
+  times: ["09:00", "13:00", "18:00"]
+  days:  ["mon", "tue", "wed", "thu", "fri"]
+  auto_publish: true             # false = the calendar plans but never sends
+  tick_seconds: 60
 
 # ── Brands ────────────────────────────────────────────────────────────────────
 # Add as many brands as you like; each carries its own copy, theme, scoring

@@ -24,7 +24,6 @@ node_modules/
 # ── App-generated content (not source) ────────────────────────
 outputs/
 image_cache/
-video_cache/
 library/
 .active_brand
 tailscale/state/

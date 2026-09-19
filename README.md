@@ -1,23 +1,28 @@
 # K2 Press — Instagram & Social Media Content Studio
 
-A self-hosted, local-AI **content studio for Instagram and social media**: create
-branded posts (manually from your own idea, or automatically from RSS/trending news
-and YouTube trailers), edit every pixel, and **publish to Instagram and other
-platforms through [Postiz](https://postiz.com)**. Multi-brand, multi-channel, and
-fully config-driven — copy `config.example.yaml` to `config.yaml` and add your own
-brands. Bring your own logo, colours, feeds, and channels.
+A self-hosted, local-AI **content studio for Instagram and Facebook**: create
+branded posts (manually from your own idea, automatically from RSS/trending news, or in
+bulk from a spreadsheet), edit every pixel, schedule them on a calendar, and **publish
+straight to Instagram and Facebook through the Meta Graph API** with your own
+credentials — no third-party scheduler in between. Multi-brand and fully config-driven —
+copy `config.example.yaml` to `config.yaml` and add your own brands. Bring your own logo,
+colours, feeds, and accounts.
 
 ## What it does
 
 - **Create posts two ways** — ✍️ **Manual** (your idea + notes + images → AI builds the
   carousel and suggests angles) or 📡 **Auto** (fetch + AI-score RSS/trending stories).
+- **Bulk from a spreadsheet** — 📄 **CSV Import** turns a sheet of post ideas (or
+  finished slide copy) into rendered carousels, with or without the AI touching the words.
 - **Many formats** — carousel, square, story, X/Twitter, quote, comparison, breaking,
-  listicle, LinkedIn — plus **9:16 Reels & video carousels** from YouTube trailers.
+  listicle, LinkedIn.
 - **Full editor** — edit every line, fetch/upload/paste/URL images per slide, live preview,
   template editor, and a Fabric.js canvas for hand layout.
-- **Publish anywhere Postiz supports** — Instagram (Business/Creator), and any other
-  channel you connect in Postiz (Facebook, LinkedIn, X, TikTok, YouTube, Threads…).
-  A review-and-approve gate sends each post to Postiz as a **draft** by default.
+- **Publish directly to Meta** — Instagram (Business/Creator) and Facebook Pages via
+  the Graph API, with your own long-lived token. A review-and-approve gate means nothing
+  goes out until you say so.
+- **Post calendar** — schedule posts on a month grid, auto-fill your usual posting slots,
+  and let the background publisher send them at the right time.
 - **Local & private** — runs on your machine with a local LLM (Hermes or Ollama). Your
   brands, keys, and channels stay in gitignored config; only the generic template ships.
 
@@ -26,8 +31,8 @@ brands. Bring your own logo, colours, feeds, and channels.
 | Doc | What's in it |
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | Install, `.env`, host vs Docker, Hermes/Ollama, auto-start |
-| [docs/PUBLISHING_AND_CHANNELS.md](docs/PUBLISHING_AND_CHANNELS.md) | **Connect Postiz + add multiple Instagram/social channels** (the publishing guide) |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `config.yaml` reference — brands, themes, feeds, formats, Postiz |
+| [docs/PUBLISHING_AND_CHANNELS.md](docs/PUBLISHING_AND_CHANNELS.md) | **Connect Instagram & Facebook, tokens, scheduling** (the publishing guide) |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `config.yaml` reference — brands, themes, feeds, formats, Meta, schedule |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the modules fit together (for contributors) |
 
 ## Tech stack
@@ -73,7 +78,7 @@ UNSPLASH_API_KEY=your_unsplash_key    # optional, free at unsplash.com/developer
 ### Configure your brand(s)
 
 Nothing in the app is hard-coded to a specific brand — all identity (name, handle,
-logo, theme, feeds, Postiz channel) is config-driven. Copy the example config and
+logo, theme, feeds, Meta account) is config-driven. Copy the example config and
 edit it:
 
 ```powershell
@@ -82,7 +87,8 @@ copy config.example.yaml config.yaml      # (the app also auto-copies it on firs
 
 Then open `config.yaml` and set your `app.name`, your brand block(s) under `brands:`
 (name, handle, logo, theme colours, scoring `profile`/`personality`, and feed URLs),
-and your Postiz `channels` (run `python postiz.py --list-channels` to get the ids).
+and your `meta.accounts` (the Instagram/Facebook ids for each brand — see
+[docs/PUBLISHING_AND_CHANNELS.md](docs/PUBLISHING_AND_CHANNELS.md)).
 Drop your logo at the `logo_path` you set (e.g. `static/logo.png`). `config.yaml` is
 **gitignored**, so your real details and keys never get committed — only the generic
 `config.example.yaml` template is tracked.
@@ -164,73 +170,95 @@ python filter.py --top 5                   # score with the configured LLM
 python plan.py   --total-slides 6          # generate a JSON plan
 python images.py "city skyline" --source unsplash
 python render.py --no-images               # render a carousel
-python postiz.py --list-channels           # list Postiz integrations
-python video_reels.py --rss "<feed>" --emit-manifest m.json   # YouTube → 9:16 manifest
+python meta.py   --verify                  # check token, accounts, and quota
+python meta.py   --list-accounts           # brands -> IG / FB ids
+python csv_import.py --template            # print a starter content CSV
 ```
 
 ---
 
-## Publishing to Instagram (Postiz)
+## Publishing to Instagram & Facebook
 
-Finished assets are pushed to a self-hosted **Postiz** instance, which posts to
-Instagram via the Meta Graph API. K2 renders nothing here — it hands Postiz the
-finished carousel / single post / reel / story plus a caption. Default mode is
-**draft**: you review the queue in the Postiz calendar, then publish.
+Finished assets go **straight to Meta's Graph API** using your own long-lived access
+token. Full setup guide: [docs/PUBLISHING_AND_CHANNELS.md](docs/PUBLISHING_AND_CHANNELS.md).
 
-**From the app:** in the **Review** tab, **Approve** pushes the post to Postiz as
-a draft (falls back to the `N8N_WEBHOOK_URL` webhook if `POSTIZ_API_KEY` is unset,
-so the queue still works standalone). When `PUBLIC_BASE_URL` is set, Postiz fetches
-the bytes over HTTP (`/upload-from-url`); otherwise local files are uploaded.
+**From the app:** the **✅ Review** tab gives each post four actions — **Approve** (mark
+ready, send nothing), **🗓 Schedule** (pick a time and destinations), **🚀 Publish now**,
+and **Reject**. Approving holds by default; set `meta.publish.on_approve: "now"` to
+publish on approve instead.
 
-**From the CLI** (`postiz.py`, the engine without the UI):
+**Setup, once:** an Instagram Business/Creator account linked to a Facebook Page, a Meta
+app with the Instagram Graph API product, and a long-lived token with
+`instagram_basic`, `instagram_content_publish`, `pages_show_list`,
+`pages_read_engagement`, `pages_manage_posts` in `.env` as `META_ACCESS_TOKEN`. Map each
+brand under `meta.accounts` in `config.yaml`, then run `python meta.py --verify`.
+
+> **Instagram needs `PUBLIC_BASE_URL`.** Meta fetches the rendered images from *you*, so
+> they must sit at a public https address serving `/outputs` (a Tailscale Funnel URL, a
+> tunnel, a CDN). `localhost` can never work. Facebook Pages take uploaded bytes and
+> work without it.
+
+**From the CLI** (`meta.py`, the engine without the UI):
 
 ```powershell
-python postiz.py --type carousel --asset s1.png --asset s2.png --caption cap.txt
-python postiz.py --type post  --asset card.png --caption "Hello 👋"
-python postiz.py --type reel  --asset reel.mp4 --caption cap.txt --dry-run
-python postiz.py --type story --asset card.png --mode draft
+python meta.py --verify
+python meta.py --type carousel --brand k2 --asset s1.png --asset s2.png --caption cap.txt
+python meta.py --type post  --brand k2 --asset card.png --caption "Hello 👋"
+python meta.py --type story --brand k2 --asset card.png --dry-run
+python meta.py --quota --brand k2
 ```
 
-`--mode` is `draft | schedule | now` (default from config). `now` is hard-guarded
-behind `postiz.publish.allow_now`; `schedule` requires `--date` (ISO8601). `--dry-run`
-builds and prints the payload without POSTing. The 30-requests/hour Postiz ceiling is
-accounted for up front (a 5-slide carousel = 6 requests; a reel = 2).
-
-Config lives in `config.yaml` under `postiz:` (instance URL, per-brand `channels`,
-modes, rate limit, reel specs). The API key is read from `POSTIZ_API_KEY` in `.env`
-(Postiz → Settings → Public API). The IG account must be Business/Creator. On the
-**Instagram Standalone** integration a reel is sent as a `post` (a 9:16 video is
-published as a Reel by Instagram itself) — the publisher handles this automatically.
+`--dry-run` validates and reports what would be sent without publishing. Instagram's
+25-posts-per-24h ceiling is tracked locally so you stop before Meta does. If no token is
+set and `N8N_WEBHOOK_URL` is configured, approving falls back to that webhook.
 
 ---
 
-## YouTube Reels & Video-Carousel (`video_reels` mode)
+## Post calendar
 
-Turn a YouTube trailer into branded **9:16** content (hook → title → CTA cards) and
-ship it as a **video carousel** or a single stitched **reel**, gated through Postiz
-as a draft. The **manifest** (JSON) is the edit surface: generate it, hand-edit the
-clips/copy/highlights, then render. Engine + CLI: `video_reels.py`. Rights-gated —
-yt-dlp downloads only when a source is cleared.
+The **🗓 Calendar** tab is the review queue laid out by date. Click a day's **＋** (or a
+post in the *Unscheduled* tray) to place it, click a scheduled post to move, cancel, or
+publish it now, and use **✨ Auto-fill slots** to drop everything queued into your next
+free posting times.
 
-```powershell
-# 1. Generate a manifest (RSS poll → LLM copy → clip pick), then stop to edit:
-python video_reels.py --rss "<channel_feed_url>" --mode carousel --emit-manifest m.json
-#    ...edit m.json: swap clip.start, rewrite text, toggle highlight, set output_mode,
-#    and set source.rights_cleared: true (you assert rights) ...
-# 2. Render + push to Postiz as a draft:
-python video_reels.py --from-manifest m.json --send
+```yaml
+schedule:
+  times: ["09:00", "13:00", "18:00"]
+  days:  ["mon", "tue", "wed", "thu", "fri"]
+  auto_publish: true      # false = the calendar plans, but nothing is sent
+  tick_seconds: 60
 ```
 
-- `--mode carousel|reel`, `--clip-method even_intervals|scene_cut|manual`, `--cards 3`,
-  `--video-id <id>` (instead of `--rss`), `--dry-run` (build manifest, no write/post).
-- Clip methods always pick **different** moments per card. `scene_cut` uses ffmpeg
-  scene detection and needs the source downloaded (so it requires clearance up front).
-- Rights: a source is cleared if `source.rights_cleared: true` in the manifest, or its
-  channel id / RSS url / video url is in `config.yaml` `video_reels.allowlist`.
-- Templates: `templates/vr_hook.html` · `vr_title.html` · `vr_cta.html` (K2 navy/teal/
-  green, logo + handle, keyword highlights) — rendered to transparent PNGs and
-  composited over the clip by ffmpeg. `config.yaml` → `video_reels:` for clip length,
-  scene threshold, and the allowlist.
+A background loop publishes posts whose slot has passed. Times are local. The app has to
+be running for a scheduled post to go out — a slot that passes while it is closed
+publishes on the next start rather than being skipped.
+
+---
+
+## CSV import
+
+**📄 CSV Import** turns a spreadsheet into posts. Column names are matched loosely (case,
+spaces, and underscores ignored, common aliases accepted), and two shapes work:
+
+```csv
+# one row per post
+title,subtitle,slide1_heading,slide1_body,slide2_heading,slide2_body,cta,caption,hashtags,image_query,schedule
+
+# one row per slide, grouped by post
+post_id,order,heading,body,image_query
+```
+
+Upload it, check the preview table, then choose how the copy is written:
+
+- **Use my text as-is** — the sheet's words are rendered verbatim. No LLM call, no
+  rewriting, fast.
+- **AI writes from each row** — the row becomes a brief and the normal planner writes the
+  post. A `notes` or `body` column is the brief.
+
+Extra columns steer each row individually: `brand`, `format`, `tone`, and `schedule`
+(e.g. `2026-09-03 09:00`, which puts the post straight onto the calendar). Rendered posts
+land in the Review queue, optionally auto-scheduled. Grab a starter sheet from the
+**⬇ Template CSV** button or `python csv_import.py --template`.
 
 ---
 
@@ -312,7 +340,7 @@ formats, image queries, hashtags, handles, and output schema.
 ```
 config.yaml          feeds (by category), slide rules, brand, LLM endpoint
 content_profile.md   niche / tone / audience — drives scoring + planning
-.env                 PEXELS_API_KEY, UNSPLASH_API_KEY (never committed)
+.env                 PEXELS_API_KEY, META_ACCESS_TOKEN, … (never committed)
 run.bat              one-click launcher
 static/
   brand.css          brand variables + slide base styles + image wash
@@ -324,7 +352,9 @@ plan.py              local AI post planning (strict JSON, 3–10 slides)
 images.py            Pexels / Unsplash / URL fetching + cache
 render.py            Jinja2 → HTML → Playwright → PNG
 llm.py               thin OpenAI-compatible client (model list + switch)
-postiz.py            Postiz publisher — engine + k2publish CLI (Instagram drafts)
+meta.py              Instagram + Facebook publisher (Graph API) — engine + CLI
+schedule.py          calendar maths: due checks, free slots, month grid
+csv_import.py        spreadsheet → posts (loose column matching, 2 sheet shapes)
 app.py               FastAPI control panel, canvas, template editor
 image_cache/         downloaded images
 outputs/             rendered carousels

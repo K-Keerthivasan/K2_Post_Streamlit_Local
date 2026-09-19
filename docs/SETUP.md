@@ -5,7 +5,6 @@ Get K2 Press running on your machine.
 ## Requirements
 
 - **Python 3.11+**
-- **ffmpeg + ffprobe** on PATH (for Reels/video)
 - A **local LLM**: either **Hermes** CLI, or **Ollama** (or any OpenAI-compatible server)
 - **Node not required** — the UI is vanilla JS served by FastAPI
 
@@ -30,8 +29,13 @@ PEXELS_API_KEY=your_pexels_key            # free at pexels.com/api  (image sourc
 UNSPLASH_API_KEY=your_unsplash_key        # optional image source
 GOOGLE_API_KEY=...                        # optional: Google image search
 GOOGLE_CSE_ID=...
-POSTIZ_API_KEY=...                        # Postiz Public API key (publishing)
-PUBLIC_BASE_URL=                          # optional: public URL Postiz can fetch media from
+META_ACCESS_TOKEN=...                     # long-lived Meta token (publishing)
+META_APP_ID=                              # Meta app > App settings > Basic
+META_APP_SECRET=                          # (exchanges short-lived tokens)
+INSTAGRAM_APP_ID=                         # Meta app > Instagram > API setup
+INSTAGRAM_APP_SECRET=                     # (a different pair from META_APP_*)
+PUBLIC_BASE_URL=                          # REQUIRED for Instagram: public https URL
+                                          # serving /outputs (Meta fetches images itself)
 ```
 
 `.env` is gitignored — your keys never get committed.
@@ -42,7 +46,7 @@ PUBLIC_BASE_URL=                          # optional: public URL Postiz can fetc
 cp config.example.yaml config.yaml        # the app also auto-copies this on first run
 ```
 
-Edit `config.yaml`: set `app.name`, your brand(s) under `brands:`, and your Postiz
+Edit `config.yaml`: set `app.name`, your brand(s) under `brands:`, and your Meta
 `channels`. Drop your logo at the `logo_path` you set. `config.yaml` is **gitignored**
 so your real brands/keys stay local. Full reference: [CONFIGURATION.md](CONFIGURATION.md).
 
@@ -80,7 +84,7 @@ the Hermes CLI isn't in the container. If Ollama is unreachable from the contain
 `OLLAMA_HOST=0.0.0.0` on the host and restart Ollama so the container can reach it.
 
 > **Host vs Docker, in one line:** run on the **host** if you want **Hermes**; use
-> **Docker** (Ollama) if you want the bundled Tailscale remote-access sidecar. Postiz
+> **Docker** (Ollama) if you want the bundled Tailscale remote-access sidecar. Publishing
 > publishing works either way.
 
 ## 6. Auto-start on login (optional, Windows)
@@ -98,5 +102,5 @@ Note: the auto-start runs **without `--reload`**, so restart it to pick up code 
 
 ## Next
 
-- Connect Postiz and your channels → [PUBLISHING_AND_CHANNELS.md](PUBLISHING_AND_CHANNELS.md)
+- Connect Instagram & Facebook → [PUBLISHING_AND_CHANNELS.md](PUBLISHING_AND_CHANNELS.md)
 - Tune brands/feeds/formats → [CONFIGURATION.md](CONFIGURATION.md)

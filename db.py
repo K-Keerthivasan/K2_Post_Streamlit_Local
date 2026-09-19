@@ -50,9 +50,13 @@ CREATE TABLE IF NOT EXISTS posts (
   status      VARCHAR(16)  NOT NULL DEFAULT 'pending',
   created     DATETIME,
   approved_at DATETIME,
+  scheduled_at DATETIME,
+  published_at DATETIME,
+  targets     JSON,
   publish     JSON,
-  INDEX idx_status  (status),
-  INDEX idx_created (created)
+  INDEX idx_status    (status),
+  INDEX idx_created   (created),
+  INDEX idx_scheduled (scheduled_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -67,6 +71,15 @@ def init() -> None:
     with _conn() as c:
         with c.cursor() as cur:
             cur.execute(_DDL)
+            # Tables created before scheduling existed are missing these columns;
+            # add them in place so an upgrade never needs a manual migration.
+            cur.execute("SHOW COLUMNS FROM posts")
+            have = {r["Field"] for r in cur.fetchall()}
+            for name, ddl in (("scheduled_at", "DATETIME"),
+                              ("published_at", "DATETIME"),
+                              ("targets", "JSON")):
+                if name not in have:
+                    cur.execute(f"ALTER TABLE posts ADD COLUMN {name} {ddl}")
     _inited = True
 
 
@@ -120,6 +133,13 @@ def load_posts() -> list[dict]:
         }
         if r["approved_at"]:
             entry["approved_at"] = _to_iso(r["approved_at"])
+        if r.get("scheduled_at"):
+            entry["scheduled_at"] = _to_iso(r["scheduled_at"])
+        if r.get("published_at"):
+            entry["published_at"] = _to_iso(r["published_at"])
+        targets = _loads(r.get("targets"))
+        if targets:
+            entry["targets"] = targets
         publish = _loads(r["publish"])
         if publish is not None:
             entry["publish"] = publish
@@ -145,6 +165,9 @@ def save_posts(items: list[dict]) -> None:
         it.get("status") or "pending",
         _to_dt(it.get("created")),
         _to_dt(it.get("approved_at")),
+        _to_dt(it.get("scheduled_at")),
+        _to_dt(it.get("published_at")),
+        json.dumps(it.get("targets")) if it.get("targets") else None,
         json.dumps(it["publish"]) if it.get("publish") is not None else None,
     ) for it in items]
 
@@ -157,8 +180,9 @@ def save_posts(items: list[dict]) -> None:
                 cur.executemany(
                     "INSERT INTO posts "
                     "(id, brand, title, format, rel, files, caption, status, "
-                    " created, approved_at, publish) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    " created, approved_at, scheduled_at, published_at, "
+                    " targets, publish) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     rows,
                 )
         conn.commit()

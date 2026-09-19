@@ -11,40 +11,48 @@ app:
 active_brand: demo           # which brand key is selected on boot
 ```
 
-## `postiz:` — publishing
+## `meta:` — publishing to Instagram & Facebook
 
 See [PUBLISHING_AND_CHANNELS.md](PUBLISHING_AND_CHANNELS.md) for the full guide.
+Credentials never live here — the token is read from the environment.
 
 ```yaml
-postiz:
-  base_url: "http://localhost:4007/api/public/v1"   # = NEXT_PUBLIC_BACKEND_URL + /public/v1
-  api_key_env: "POSTIZ_API_KEY"        # env var name holding the Public API key
-  channels:                            # brand key -> Postiz integration id (or name)
-    demo: "your-integration-id-or-name"
+meta:
+  api_version: "v21.0"
+  token_env: "META_ACCESS_TOKEN"       # env var name holding the long-lived token
+  accounts:                            # one entry per brand key you publish for
+    demo:
+      ig_user_id: "17841400000000000"  # Instagram Business account id, not the @handle
+      fb_page_id: "1234567890"         # linked Page (optional; needed for facebook)
+      targets: ["instagram"]           # instagram | facebook | both
+      # token_env: "META_ACCESS_TOKEN_DEMO"   # optional per-brand token
   publish:
-    default_mode: "draft"              # draft | schedule | now
-    allow_now: false                   # must be true to allow mode "now"
+    default_targets: ["instagram"]     # used when an account sets no targets
+    on_approve: "hold"                 # hold = approve, then schedule/publish yourself
+                                       # now  = approving publishes immediately
+    allow_now: true
   rate_limit:
-    max_requests_per_hour: 30
+    max_posts_per_day: 25              # Instagram's own 24h ceiling
     safety_margin: 2                   # effective ceiling = max - margin
-  reel:
-    require_9x16: true
-    min_seconds: 5
-    max_seconds: 90
 ```
 
-## `video_reels:` — YouTube → 9:16
+An unmapped brand raises an error rather than falling back to another account.
+
+## `schedule:` — the post calendar
 
 ```yaml
-video_reels:
-  default_clip_seconds: 4.0      # per-card clip length
-  scene_threshold: 0.4           # ffmpeg scene-change sensitivity (scene_cut method)
-  allowlist: []                  # cleared YouTube channel_ids / RSS urls / video urls
+schedule:
+  times: ["09:00", "13:00", "18:00"]   # slots "Auto-fill" uses, local time
+  days:  ["mon", "tue", "wed", "thu", "fri"]
+  auto_publish: true                   # false = the calendar plans, nothing is sent
+  tick_seconds: 60                     # how often to check for due posts
 ```
+
+Editable in the UI from **🗓 Calendar → ⚙ Slots**, which writes back to this file.
 
 ## `brands:` — one block per brand
 
-The brand **key** (e.g. `demo`, `k2`, `jkr`) is what you reference in `postiz.channels`
+The brand **key** (e.g. `demo`, `k2`, `jkr`) is what you reference in `meta.accounts`
 and the Brand dropdown.
 
 ```yaml
@@ -53,7 +61,7 @@ brands:
     name:      "Your Brand"       # display name (and sidebar logo text)
     short:     "YB"
     author:    "Your Name"        # byline
-    handle:    "@yourbrand"       # shown on cards/reels
+    handle:    "@yourbrand"       # shown on cards
     instagram: "yourbrand"
     tagline:   "Your tagline"
     pitch:     "What you do, in one line."
@@ -76,12 +84,6 @@ brands:
       accent:  "#00B4C8"          # primary accent
       accent2: "#00C896"          # secondary accent
       text:    "#FFFFFF"
-    video:                        # 9:16 Reels styling (see config.example.yaml for all keys)
-      enabled: true
-      color_grade: { overlay: "#0A0F1E", opacity: 0.15 }
-      captions:   { font_size: 54, text_color: "#FFFFFF", box_opacity: 0.55, position: 0.74 }
-      hook_card:  { enabled: true, duration: 2.0 }
-      end_card:   { enabled: true, duration: 3.0, cta: "Link in bio" }
     profile: >
       Describe your niche + audience + what should score high. Drives 0-100 story scoring.
     personality: >

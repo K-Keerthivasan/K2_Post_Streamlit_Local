@@ -1,17 +1,20 @@
-"""Multi-brand carousel/reel generator with live editor and canvas design tool.
+"""Multi-brand carousel/reel generator with dashboard, review, and export tools.
 
-Brand identity (name, handle, theme, feeds, Postiz channel) is config-driven —
+Brand identity (name, handle, theme, feeds, Meta account) is config-driven —
 see config.yaml (copy config.example.yaml to start). Nothing here is specific to
 any one brand."""
 from __future__ import annotations
 import asyncio
+import io
 import json
 import os
 import re
 import shutil
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -40,15 +43,13 @@ def _app_name() -> str:
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title=_app_name())
 
-for _d in ("outputs", "image_cache", "library", "library/plans", "library/stories",
-           "video_cache", "video_cache/out", "video_cache/clips", "video_cache/tmp"):
+for _d in ("outputs", "image_cache", "library", "library/plans", "library/stories"):
     Path(_d).mkdir(parents=True, exist_ok=True)
 
 app.mount("/static",      StaticFiles(directory="static"),      name="static")
 app.mount("/outputs",     StaticFiles(directory="outputs"),      name="outputs")
 app.mount("/image_cache", StaticFiles(directory="image_cache"),  name="images")
 app.mount("/assets",      StaticFiles(directory="Assets"),       name="assets")
-app.mount("/video_cache", StaticFiles(directory="video_cache"),  name="video_cache")
 
 _executor = ThreadPoolExecutor(max_workers=3)
 
@@ -340,20 +341,6 @@ def _sync_generate_scripts(story_dict, topic, keywords, platform, content_type,
     )
 
 
-def _sync_video_generate(youtube_url, start, end, rights_cleared, script, brand_key):
-    """Extract a YouTube segment and composite a branded reel. Returns the output
-    path relative to video_cache (for the /video_cache static mount)."""
-    import video
-    from brands import resolve_brand
-    config = _cfg()
-    brand  = resolve_brand(config, brand_key)
-    clip   = video.extract_clip(youtube_url, start, end, rights_cleared=rights_cleared)
-    out    = video.composite(clip, script or {}, brand)
-    rel    = Path(out).relative_to("video_cache").as_posix()
-    return {"url": f"/video_cache/{rel}", "file": Path(out).name,
-            "duration": round(video.probe_duration(out), 2)}
-
-
 def _sync_fetch_images(plan, source):
     from images import fetch_images_for_plan
     raw = fetch_images_for_plan(plan, source=source)
@@ -519,7 +506,7 @@ def _render_item(story_dict, fmt, *, config, brand, brand_key, out_root,
         files   = sorted(p.name for p in Path(out_dir).glob("*.png"))
         # True only if at least one slide actually got a background image — lets
         # the UI flag fully-blank renders (e.g. "No images (fast)" mode) before
-        # they're sent to Review/Postiz looking unfinished.
+        # they're published looking unfinished.
         has_images = bool(img_paths) and any(img_paths.values())
         return {
             "title":       story.title,
@@ -869,17 +856,49 @@ async def api_agent_reset():
 REVIEW_FILE = Path("library/review_queue.json")
 
 
+def _drop_legacy_publish(items: list[dict]) -> list[dict]:
+    """Forget publish records left by the old Postiz adapter.
+
+    Their errors ("rate limit: 4 requests left this hour") describe a service the
+    app no longer talks to, so showing them on a card is worse than showing
+    nothing. Dropped on read; the next save makes it permanent."""
+    for it in items:
+        if (it.get("publish") or {}).get("via") == "postiz":
+            it.pop("publish", None)
+    return items
+
+
+def _restore_blocked_schedules(items: list[dict]) -> list[dict]:
+    """Put back posts an older build dropped off the calendar.
+
+    Until publishing learned to tell "Meta refused this" apart from "publishing
+    is not set up yet", a scheduled post whose slot passed with no token
+    configured was quietly marked approved and never retried — it simply
+    vanished from the calendar with nothing to say why. Anything that still has
+    its slot, never reached Meta, and failed for a setup reason goes back to
+    scheduled so it publishes once the setup is finished."""
+    for it in items:
+        pub = it.get("publish") or {}
+        if (it.get("status") == "approved" and it.get("scheduled_at")
+                and pub and not pub.get("sent")
+                and not pub.get("error") and not pub.get("errors")):
+            it["status"] = "scheduled"
+            it.setdefault("blocked_reason", pub.get("reason") or "publishing was not configured")
+    return items
+
+
 def _review_load() -> list[dict]:
     """Read the post queue from MySQL when configured, else the JSON file.
     MySQL errors fall back to JSON so a DB hiccup never breaks the queue."""
     import db
     if db.enabled():
         try:
-            return db.load_posts()
+            return _restore_blocked_schedules(_drop_legacy_publish(db.load_posts()))
         except Exception as e:
             print(f"[review] MySQL load failed, using JSON file: {e}")
     try:
-        return json.loads(REVIEW_FILE.read_text(encoding="utf-8"))
+        return _restore_blocked_schedules(
+            _drop_legacy_publish(json.loads(REVIEW_FILE.read_text(encoding="utf-8"))))
     except Exception:
         return []
 
@@ -921,64 +940,88 @@ def _review_enqueue(posts: list[dict]) -> list[dict]:
     return added
 
 
-_VIDEO_EXTS = (".mp4", ".mov", ".m4v")
-
-
-def _postiz_type(entry: dict) -> str:
-    """Map a K2 review entry (format + files) to a Postiz content type."""
-    files = entry.get("files", [])
-    if files and files[0].lower().endswith(_VIDEO_EXTS):
-        return "reel"
+def _meta_type(entry: dict) -> str:
+    """Map a review entry (format + files) to a Meta content type."""
     fmt = (entry.get("format") or "").lower()
-    if fmt == "carousel" or len(files) > 1:
-        return "carousel"
     if fmt == "story":
         return "story"
-    return "post"            # square / xpost / single → single IG post
+    if fmt in ("carousel", "listicle") or len(entry.get("files", [])) > 1:
+        return "carousel"
+    return "post"            # square / xpost / quote / single -> one IG image
 
 
-def _postiz_publish(entry: dict) -> dict:
-    """Publish an approved post to Postiz as a draft. Prefers /upload-from-url
-    when PUBLIC_BASE_URL is set (so a remote/Dockerized Postiz can fetch the
-    bytes), else uploads the local files. No-op (sent=False) when the Postiz API
-    key is unset, so the queue still works standalone."""
-    import postiz
-    cfg = postiz.load_config(_cfg())
-    if not os.environ.get(cfg.get("api_key_env", "POSTIZ_API_KEY"), "").strip():
-        return {"sent": False, "reason": "POSTIZ_API_KEY not set"}
-    files, rel = entry.get("files", []), entry.get("rel", "")
-    if not files or not rel:
+def _entry_assets(entry: dict) -> tuple[list[str], list[str]]:
+    """(local paths, public URLs) for an entry's rendered PNGs.
+
+    Instagram needs the URLs (Meta fetches the bytes itself); Facebook prefers
+    the local paths so it works even without a public address."""
+    rel   = entry.get("rel", "")
+    files = entry.get("files", [])
+    paths = [str(Path("outputs") / rel / f) for f in files]
+    base  = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    urls  = [f"{base}/outputs/{rel}/{f}" for f in files] if base else []
+    return paths, urls
+
+
+def _meta_publish(entry: dict) -> dict:
+    """Publish an approved post straight to Instagram / Facebook via the Graph
+    API. No-op (sent=False) when no Meta token is configured, so the queue still
+    works standalone."""
+    import meta
+    cfg = meta.load_config(_cfg())
+    if not meta.configured(cfg) and os.environ.get("N8N_WEBHOOK_URL", "").strip():
+        return {"sent": False, "reason": "No Meta access token set (META_ACCESS_TOKEN)"}
+    if not entry.get("files") or not entry.get("rel"):
         return {"sent": False, "reason": "no assets to publish"}
-    ptype = _postiz_type(entry)
-    chan = entry.get("brand") or "instagram"   # route each brand to its own IG integration
-    base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+    paths, urls = _entry_assets(entry)
+    targets = entry.get("targets") or None
+
+    # Check every constraint locally first. A blocked post is a setup problem,
+    # not a failed post — it keeps its slot and goes out once the setup is fixed.
+    report = meta.preflight(entry.get("brand") or "", ptype=_meta_type(entry),
+                            assets=paths, asset_urls=urls,
+                            caption=entry.get("caption", ""), targets=targets,
+                            config=_cfg(), network=False)
+    if not report["ok"]:
+        first = next((c for c in report["checks"]
+                      if not c["ok"] and c["level"] == "block"), {})
+        return {"sent": False, "via": "meta", "blocked": report["blocking"],
+                "reason": first.get("detail") or "publishing is not configured yet",
+                "preflight": report}
+
     try:
-        if base:
-            urls = [f"{base}/outputs/{rel}/{f}" for f in files]
-            res = postiz.publish(type=ptype, assets=[], asset_urls=urls, channel=chan,
-                                 caption=entry.get("caption", ""), mode="draft", config=_cfg())
-        else:
-            paths = [str(Path("outputs") / rel / f) for f in files]
-            res = postiz.publish(type=ptype, assets=paths, channel=chan,
-                                 caption=entry.get("caption", ""), mode="draft", config=_cfg())
-        return {"sent": True, "via": "postiz", "post_id": res.get("post_id"),
-                "post_type": res.get("post_type")}
+        res = meta.publish(
+            brand=entry.get("brand") or "", ptype=_meta_type(entry),
+            assets=paths, asset_urls=urls, caption=entry.get("caption", ""),
+            targets=targets, config=_cfg(),
+        )
+        out = {"sent": bool(res.get("results")), "via": "meta",
+               "results": res.get("results", []), "errors": res.get("errors", [])}
+        first = (res.get("results") or [{}])[0]
+        out["permalink"] = first.get("permalink", "")
+        out["post_id"] = first.get("media_id", "")
+        if res.get("errors") and not res.get("results"):
+            out["error"] = res["errors"][0].get("error", "publish failed")
+        return out
     except Exception as e:
-        return {"sent": False, "via": "postiz", "error": str(e)}
+        return {"sent": False, "via": "meta", "error": str(e)}
 
 
 def _sync_publish(entry: dict) -> dict:
-    """Publish an approved post. Tries Postiz first (when POSTIZ_API_KEY is set),
-    else falls back to the configured n8n webhook. No-op (but still marks
-    approved) if neither is configured, so the queue works standalone."""
+    """Publish an approved post. Meta first (when a token is configured), else
+    the optional n8n webhook. No-op (but still marks approved) if neither is set,
+    so the queue works standalone."""
     import requests
-    pz = _postiz_publish(entry)
-    if pz.get("sent") or pz.get("via") == "postiz":
-        return pz                       # Postiz handled it (success or real error)
+    import meta
+    mp = _meta_publish(entry)
+    if mp.get("sent") or mp.get("via") == "meta":
+        return mp                       # Meta handled it (success or real error)
 
     url = os.environ.get("N8N_WEBHOOK_URL", "").strip()
     if not url:
-        return {"sent": False, "reason": "POSTIZ_API_KEY / N8N_WEBHOOK_URL not set"}
+        return {"sent": False, "reason": mp.get("reason")
+                or "META_ACCESS_TOKEN / N8N_WEBHOOK_URL not set"}
     base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     images = [f"{base}/outputs/{entry['rel']}/{f}" for f in entry.get("files", [])]
     payload = {
@@ -997,6 +1040,33 @@ def _sync_publish(entry: dict) -> dict:
         return {"sent": False, "via": "n8n", "error": str(e)}
 
 
+def _publish_entry(entry: dict) -> dict:
+    """Publish one queue entry and stamp the result onto it. Shared by the manual
+    'publish now' path and the background scheduler so both record state the
+    same way."""
+    was = entry.get("status")
+    pub = _sync_publish(entry)
+    entry["publish"] = pub
+    entry["publish_attempts"] = int(entry.get("publish_attempts") or 0) + 1
+    entry["last_attempt_at"] = datetime.now().isoformat(timespec="seconds")
+    if pub.get("sent"):
+        entry["status"] = "published"
+        entry["published_at"] = datetime.now().isoformat(timespec="seconds")
+        entry.pop("blocked_since", None)
+    elif pub.get("error") or pub.get("errors"):
+        entry["status"] = "failed"       # Meta saw it and said no
+    else:
+        # Setup is incomplete (no token, no ig_user_id, no public URL, no
+        # publisher at all). The post never left the machine, so it keeps its
+        # slot and the next tick retries it — silently dropping it to "approved"
+        # is how posts used to go missing after their slot passed, with nothing
+        # on the card to say why.
+        entry["status"] = was if was == "scheduled" else "approved"
+        entry["blocked_reason"] = pub.get("reason") or "publishing is not configured"
+        entry.setdefault("blocked_since", entry["last_attempt_at"])
+    return pub
+
+
 @app.get("/api/review")
 async def api_review_list(status: str = ""):
     items = _review_load()
@@ -1007,18 +1077,209 @@ async def api_review_list(status: str = ""):
     return {"items": items, "pending": pending}
 
 
-@app.post("/api/review/{rid}/approve")
-async def api_review_approve(rid: str):
-    items = _review_load()
+def _dashboard_items(brand: str = "", limit: int = 4) -> list[dict]:
+    """Return the newest rendered carousel posts used by the dashboard."""
+    items = [i for i in _review_load()
+             if i.get("status") != "rejected"
+             and (i.get("format") in ("carousel", "listicle")
+                  or len(i.get("files") or []) > 1)
+             and (not brand or i.get("brand") == brand)]
+    items.sort(key=lambda i: i.get("created", ""), reverse=True)
+    return items[:max(1, min(limit, 20))]
+
+
+def _post_instructions(entry: dict, position: int = 0,
+                       suggested_at: str = "") -> str:
+    """Human-readable handoff bundled beside a post's ordered image files."""
+    when = entry.get("scheduled_at") or suggested_at or "Choose the next available posting slot"
+    files = entry.get("files") or []
+    targets = ", ".join(entry.get("targets") or []) or "Instagram / selected brand channels"
+    caption = (entry.get("caption") or "No caption supplied").strip()
+    title = (entry.get("title") or "Untitled carousel").strip()
+    order = "\n".join(f"{i + 1}. `{name}`" for i, name in enumerate(files)) or "No image files"
+    number = f" {position}" if position else ""
+    return f"""# Post{number}: {title}
+
+## Publishing details
+
+- Brand: {entry.get('brand') or 'Not specified'}
+- Format: {entry.get('format') or 'carousel'}
+- Status: {entry.get('status') or 'ready'}
+- Post at: {when}
+- Channels: {targets}
+
+## Caption
+
+{caption}
+
+## Carousel order
+
+Upload the images in this exact order:
+
+{order}
+
+## Final check
+
+- Confirm the first image is the cover.
+- Keep the image order shown above.
+- Paste the full caption, including hashtags.
+- Confirm the selected account and scheduled time before publishing.
+- Preview the carousel once, then publish or schedule it.
+"""
+
+
+@app.get("/api/dashboard")
+async def api_dashboard(brand: str = ""):
+    """One compact overview for the modern landing dashboard."""
+    import schedule as sched
+    all_items = [i for i in _review_load() if not brand or i.get("brand") == brand]
+    posts = _dashboard_items(brand, 4)
+    taken = [i.get("scheduled_at") for i in all_items if i.get("scheduled_at")]
+    unscheduled = sum(1 for i in all_items
+                      if i.get("status") in ("pending", "approved", "failed")
+                      and not i.get("scheduled_at"))
+    try:
+        suggestions = sched.next_slots(len(posts), config=_cfg(), taken=taken,
+                                       start=datetime.now())
+    except Exception:
+        suggestions = []
+    post_rows = []
+    for idx, item in enumerate(posts):
+        row = dict(item)
+        row["suggested_at"] = sched.iso(suggestions[idx]) if idx < len(suggestions) else ""
+        post_rows.append(row)
+    return {
+        "posts": post_rows,
+        "counts": {
+            "total": len(all_items),
+            "pending": sum(1 for i in all_items if i.get("status") == "pending"),
+            "scheduled": sum(1 for i in all_items if i.get("status") == "scheduled"),
+            "published": sum(1 for i in all_items if i.get("status") == "published"),
+            "ready": unscheduled,
+        },
+    }
+
+
+def _export_zip(entries: list[dict]) -> bytes:
+    import schedule as sched
+    out = io.BytesIO()
+    try:
+        suggestions = sched.next_slots(len(entries), config=_cfg(), start=datetime.now())
+    except Exception:
+        suggestions = []
+    guide = ["# Social Post Handoff\n",
+             "This package contains ready-to-post carousel images and instructions.\n"]
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for idx, entry in enumerate(entries, start=1):
+            safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "-", entry.get("title") or "carousel").strip("-")[:60] or "carousel"
+            folder = f"{idx:02d}-{safe_title}"
+            suggested = sched.iso(suggestions[idx - 1]) if idx <= len(suggestions) else ""
+            instructions = _post_instructions(entry, idx, suggested)
+            guide.append(instructions)
+            archive.writestr(f"{folder}/INSTRUCTIONS.md", instructions)
+            rel = entry.get("rel") or ""
+            for image_idx, filename in enumerate(entry.get("files") or [], start=1):
+                path = (Path("outputs") / rel / filename).resolve()
+                output_root = Path("outputs").resolve()
+                if output_root in path.parents and path.is_file():
+                    archive.write(path, f"{folder}/{image_idx:02d}-{Path(filename).name}")
+        archive.writestr("POSTING_GUIDE.md", "\n\n---\n\n".join(guide))
+    return out.getvalue()
+
+
+@app.get("/api/export/{rid}")
+async def api_export_post(rid: str):
+    entry = _find_entry(_review_load(), rid)
+    payload = _export_zip([entry])
+    return Response(payload, media_type="application/zip", headers={
+        "Content-Disposition": f'attachment; filename="carousel-{rid}.zip"',
+        "Cache-Control": "no-store",
+    })
+
+
+@app.get("/api/export-dashboard")
+async def api_export_dashboard(brand: str = ""):
+    entries = _dashboard_items(brand, 4)
+    if not entries:
+        raise HTTPException(404, "No rendered carousels are available to export.")
+    payload = _export_zip(entries)
+    label = re.sub(r"[^a-zA-Z0-9_-]+", "-", brand or "all-brands").strip("-")
+    return Response(payload, media_type="application/zip", headers={
+        "Content-Disposition": f'attachment; filename="{label}-carousel-pack.zip"',
+        "Cache-Control": "no-store",
+    })
+
+
+def _find_entry(items: list[dict], rid: str) -> dict:
     entry = next((i for i in items if i.get("id") == rid), None)
     if not entry:
         raise HTTPException(404, "Not found")
-    pub = await _run(_sync_publish, entry)
-    entry["status"] = "published" if pub.get("sent") else "approved"
+    return entry
+
+
+@app.post("/api/review/{rid}/approve")
+async def api_review_approve(rid: str, body: dict = Body(default={})):
+    """Approve a post. What happens next is deliberate rather than automatic:
+
+    ``hold`` (the default) just marks it ready so you can schedule it on the
+    calendar; ``now`` publishes immediately. Set meta.publish.on_approve in
+    config.yaml, or override per-click with {"publish": true}."""
+    import meta
+    items = _review_load()
+    entry = _find_entry(items, rid)
     entry["approved_at"] = datetime.now().isoformat(timespec="seconds")
-    entry["publish"] = pub
+    if body and body.get("targets"):
+        entry["targets"] = list(body["targets"])
+
+    mode = (meta.load_config(_cfg())["publish"].get("on_approve") or "hold").lower()
+    publish_now = body.get("publish") if body and "publish" in body else (mode == "now")
+
+    if publish_now:
+        pub = await _run(_publish_entry, entry)
+    else:
+        entry["status"] = "approved"
+        pub = {"sent": False, "reason": "approved — schedule it or publish now"}
+        entry["publish"] = pub
     _review_save(items)
     return {"ok": True, "publish": pub, "item": entry}
+
+
+@app.post("/api/review/{rid}/publish")
+async def api_review_publish(rid: str, body: dict = Body(default={})):
+    """Publish one queued post to Instagram / Facebook right now."""
+    items = _review_load()
+    entry = _find_entry(items, rid)
+    if body and body.get("targets"):
+        entry["targets"] = list(body["targets"])
+    entry.setdefault("approved_at", datetime.now().isoformat(timespec="seconds"))
+    pub = await _run(_publish_entry, entry)
+    _review_save(items)
+    return {"ok": bool(pub.get("sent")), "publish": pub, "item": entry}
+
+
+@app.put("/api/review/{rid}")
+async def api_review_update(rid: str, body: dict = Body(default={})):
+    """Edit a queued post before it goes out (caption / targets / schedule)."""
+    import schedule as sched
+    items = _review_load()
+    entry = _find_entry(items, rid)
+    b = body or {}
+    if "caption" in b:
+        entry["caption"] = b.get("caption") or ""
+    if "targets" in b:
+        entry["targets"] = list(b.get("targets") or [])
+    if "scheduled_at" in b:
+        try:
+            when = sched.parse_when(b.get("scheduled_at"))
+        except sched.ScheduleError as e:
+            raise HTTPException(400, str(e))
+        entry["scheduled_at"] = sched.iso(when)
+        if when and entry.get("status") in ("pending", "approved", "failed"):
+            entry["status"] = "scheduled"
+        elif not when and entry.get("status") == "scheduled":
+            entry["status"] = "approved"
+    _review_save(items)
+    return {"ok": True, "item": entry}
 
 
 @app.post("/api/review/{rid}/reject")
@@ -1065,10 +1326,10 @@ async def api_delete_output(rel: str):
 
 @app.post("/api/review/enqueue")
 async def api_review_enqueue(body: dict = Body(default={})):
-    """Push an already-rendered post into the review queue. Used by the Editor's
-    and Bulk results' 'Send to Review' buttons so manually-previewed posts can be
-    approved → drafted to Postiz, the same as Agent/autopilot output. Body is a
-    post dict: {brand, title, format, rel, files, caption}."""
+    """Push an already-rendered post into the review queue. Used by automated
+    creation and Bulk result actions so generated posts can be
+    approved → scheduled or published, the same as Agent/autopilot output. Body
+    is a post dict: {brand, title, format, rel, files, caption}."""
     b = body or {}
     rel   = (b.get("rel") or "").strip()
     files = [f for f in (b.get("files") or []) if (Path("outputs") / rel / f).is_file()]
@@ -1095,6 +1356,510 @@ async def api_review_clear(body: dict = Body(default={})):
         items = []
     _review_save(items)
     return {"ok": True}
+
+
+# ── CSV import: a content sheet -> rendered carousels ─────────────
+# Upload a spreadsheet of post ideas (or finished slide copy) and turn each row
+# into a real post. See csv_import.py for the accepted column shapes.
+
+_CSV_UPLOAD = Path("library/last_import.csv")
+
+
+def _sync_csv_generate(posts, *, brand_key, fmt, mode, model, source, save,
+                       total_slides, tone):
+    """Render one post per CSV row.
+
+    ``direct`` uses the sheet copy verbatim (no LLM — what you wrote is what gets
+    rendered); ``ai`` treats each row as a brief and runs the normal planner."""
+    import csv_import
+    from brands import resolve_brand
+    from images import fetch_images_for_plan, fetch_image
+    from render import generate_post, CAROUSEL_FORMATS
+
+    config = _cfg()
+    brand = resolve_brand(config, brand_key)
+    if not save:
+        _clear_tmp()
+    out_root = _out_root_for(brand_key, save)
+
+    results = []
+    total = len(posts)
+    _set_progress(0, total, brand=brand_key)
+
+    for i, post in enumerate(posts):
+        if _cancelled():
+            break
+        row_fmt = post.get("format") or fmt
+        if not _fmt_allowed(row_fmt, brand_key, config):
+            results.append({"title": post.get("title", ""), "format": row_fmt,
+                            "brand": brand_key, "ok": False, "skipped": True,
+                            "error": f"{row_fmt} is not available for this brand"})
+            continue
+        _set_progress(i, total, current=post.get("title", ""), brand=brand_key)
+        try:
+            if mode == "ai":
+                from feeds import Story
+                from plan import plan_story, plan_post
+                story_dict = csv_import.to_story(post)
+                if row_fmt in ("carousel", "listicle"):
+                    plan = plan_story(Story(**story_dict), config,
+                                      total_slides=total_slides, model=model,
+                                      brand=brand, tone=post.get("tone") or tone,
+                                      manual_mode=True)
+                    plan.setdefault("format", row_fmt)
+                else:
+                    plan = plan_post(Story(**story_dict), row_fmt, config=config,
+                                     model=model, brand=brand,
+                                     tone=post.get("tone") or tone)
+                # Anything the sheet states outright beats the model wording.
+                if post.get("caption"):
+                    plan["caption"] = post["caption"]
+                if post.get("hashtags"):
+                    plan["hashtags"] = post["hashtags"]
+            else:
+                plan = csv_import.to_plan(post, brand, fmt=row_fmt)
+
+            img_paths = None
+            if source != "none":
+                try:
+                    if row_fmt in CAROUSEL_FORMATS:
+                        img_paths = fetch_images_for_plan(plan, source=source)
+                    else:
+                        q = plan.get("image_query") or post.get("image_query")
+                        if q:
+                            img_paths = {0: fetch_image(q, source)}
+                except Exception as ie:
+                    print(f"[csv] image fetch failed: {ie}")
+
+            out_dir = generate_post(plan, row_fmt, img_paths, out_root=out_root,
+                                    brand_key=brand_key)
+            files = sorted(p.name for p in Path(out_dir).glob("*.png"))
+            results.append({
+                "title": post.get("title", ""), "format": row_fmt,
+                "brand": brand_key, "slug": plan.get("slug", ""),
+                "rel": Path(out_dir).relative_to("outputs").as_posix(),
+                "files": files, "caption": plan.get("caption", ""),
+                "plan": plan, "schedule": post.get("schedule", ""),
+                "has_images": bool(img_paths) and any(img_paths.values()),
+                "ok": True,
+            })
+        except Exception as e:
+            results.append({"title": post.get("title", ""), "format": row_fmt,
+                            "brand": brand_key, "ok": False, "error": str(e)})
+
+    _set_progress(total, total, brand=brand_key, running=False)
+    return {"batch_dir": out_root.as_posix(), "saved": save, "results": results}
+
+
+@app.get("/api/csv/template")
+async def api_csv_template():
+    """Download a starter sheet with the column names the importer expects."""
+    import csv_import
+    return Response(csv_import.TEMPLATE_CSV, media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="content-template.csv"'})
+
+
+@app.post("/api/csv/preview")
+async def api_csv_preview(file: UploadFile = File(...)):
+    """Parse an uploaded sheet and report what was found — shape, column mapping,
+    and the posts it would build — before anything is rendered."""
+    import csv_import
+    raw = await file.read()
+    if len(raw) > 5_000_000:
+        raise HTTPException(400, "That CSV is larger than 5 MB.")
+    try:
+        headers, rows = csv_import.read_csv(raw)
+        info = csv_import.inspect(headers, rows)
+    except csv_import.CsvImportError as e:
+        raise HTTPException(400, str(e))
+    _CSV_UPLOAD.parent.mkdir(parents=True, exist_ok=True)
+    _CSV_UPLOAD.write_bytes(raw)              # so a re-generate needs no re-upload
+    info["filename"] = file.filename
+    return info
+
+
+@app.post("/api/csv/generate")
+async def api_csv_generate(body: dict = Body(...)):
+    """Render the imported rows into posts.
+
+    Body: {posts?, brand?, format, mode: direct|ai, source, save, total_slides,
+    tone, enqueue, autoschedule}. Omitting ``posts`` re-reads the last upload."""
+    import csv_import
+    b = body or {}
+    posts = b.get("posts")
+    if not posts:
+        if not _CSV_UPLOAD.exists():
+            raise HTTPException(400, "Upload a CSV first.")
+        headers, rows = csv_import.read_csv(_CSV_UPLOAD.read_bytes())
+        posts = csv_import.to_posts(headers, rows, mapping=b.get("mapping") or None)
+    if not posts:
+        raise HTTPException(400, "No usable rows in that sheet.")
+
+    _apply_brand(b.get("brand"))
+    from brands import active_key
+    brand_key = b.get("brand") or active_key(_cfg()) or "default"
+    mode = (b.get("mode") or "direct").lower()
+    if mode not in ("direct", "ai"):
+        raise HTTPException(400, "mode must be direct or ai")
+
+    _acquire("csv import")
+    t0 = time.time()
+    try:
+        # _run only forwards positional args, so bind the keywords here.
+        job = partial(_sync_csv_generate, posts,
+                      brand_key=brand_key, fmt=b.get("format") or "carousel",
+                      mode=mode, model=b.get("model"),
+                      source=b.get("source", "pexels"),
+                      save=bool(b.get("save", True)),
+                      total_slides=b.get("total_slides"), tone=b.get("tone", ""))
+        res = await _run(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+    ok = [r for r in res["results"] if r.get("ok")]
+    if b.get("enqueue", True) and ok:
+        added = _review_enqueue(ok)
+        # A `schedule` column in the sheet puts the post straight on the calendar.
+        import schedule as sched
+        items = _review_load()
+        by_id = {i["id"]: i for i in items}
+        changed = False
+        for entry, result in zip(added, ok):
+            when = None
+            if result.get("schedule"):
+                try:
+                    when = sched.parse_when(result["schedule"])
+                except sched.ScheduleError:
+                    when = None
+            if when:
+                row = by_id.get(entry["id"])
+                if row:
+                    row["scheduled_at"] = sched.iso(when)
+                    row["status"] = "scheduled"
+                    changed = True
+        if changed:
+            _review_save(items)
+        if b.get("autoschedule"):
+            await api_calendar_autofill({"ids": [e["id"] for e in added]})
+        res["queued"] = len(added)
+
+    res["elapsed"] = round(time.time() - t0, 1)
+    res["ok_count"] = len(ok)
+    return res
+
+
+# ── Calendar & scheduling ─────────────────────────────────────────
+# The queue is the calendar: an entry with a `scheduled_at` and status
+# "scheduled" is a slot on the grid, and the background ticker publishes it when
+# its time arrives.
+
+_SCHEDULABLE = ("pending", "approved", "scheduled", "failed")
+
+
+@app.get("/api/calendar")
+async def api_calendar(year: int = 0, month: int = 0, brand: str = ""):
+    """A month of queued posts, grouped into weeks for the calendar grid."""
+    import schedule as sched
+    now = datetime.now()
+    year = year or now.year
+    month = month or now.month
+    if not 1 <= month <= 12:
+        raise HTTPException(400, "month must be 1-12")
+
+    items = [i for i in _review_load()
+             if i.get("status") in _SCHEDULABLE + ("published",)]
+    if brand:
+        items = [i for i in items if i.get("brand") == brand]
+    grid = sched.month_grid(year, month, items)
+    grid["undated"] = [i for i in grid["undated"] if i.get("status") in _SCHEDULABLE]
+    grid["slots"] = sched.slot_config(_cfg())
+    return grid
+
+
+@app.post("/api/calendar/schedule")
+async def api_calendar_schedule(body: dict = Body(...)):
+    """Put one post on the calendar (or move it). Body: {id, when, targets?}"""
+    import schedule as sched
+    rid = (body.get("id") or "").strip()
+    if not rid:
+        raise HTTPException(400, "No post id given.")
+    try:
+        when = sched.parse_when(body.get("when"))
+    except sched.ScheduleError as e:
+        raise HTTPException(400, str(e))
+    if not when:
+        raise HTTPException(400, "Provide a date/time to schedule.")
+
+    items = _review_load()
+    entry = _find_entry(items, rid)
+    entry["scheduled_at"] = sched.iso(when)
+    entry["status"] = "scheduled"
+    if body.get("targets"):
+        entry["targets"] = list(body["targets"])
+    entry.setdefault("approved_at", datetime.now().isoformat(timespec="seconds"))
+    entry.pop("publish", None)              # a re-schedule clears the old failure
+    _review_save(items)
+    return {"ok": True, "item": entry}
+
+
+@app.post("/api/calendar/unschedule")
+async def api_calendar_unschedule(body: dict = Body(...)):
+    """Take a post off the calendar; it stays in the queue as approved."""
+    items = _review_load()
+    entry = _find_entry(items, (body.get("id") or "").strip())
+    entry["scheduled_at"] = ""
+    if entry.get("status") == "scheduled":
+        entry["status"] = "approved"
+    _review_save(items)
+    return {"ok": True, "item": entry}
+
+
+@app.post("/api/calendar/autofill")
+async def api_calendar_autofill(body: dict = Body(default={})):
+    """Drop every unscheduled post into the next free posting slots.
+
+    Slots come from config.yaml -> schedule.times/days, and slots already taken
+    by a scheduled post are skipped, so running this twice never double-books."""
+    import schedule as sched
+    b = body or {}
+    items = _review_load()
+    ids = b.get("ids") or []
+    brand = b.get("brand") or ""
+
+    if ids:
+        queue = [i for i in items if i.get("id") in ids]
+    else:
+        queue = [i for i in items
+                 if i.get("status") in ("pending", "approved")
+                 and not i.get("scheduled_at")
+                 and (not brand or i.get("brand") == brand)]
+    queue.sort(key=lambda i: i.get("created", ""))
+    if b.get("limit"):
+        queue = queue[:int(b["limit"])]
+    if not queue:
+        return {"ok": True, "scheduled": 0, "items": []}
+
+    taken = [i.get("scheduled_at") for i in items if i.get("status") == "scheduled"]
+    try:
+        start = sched.parse_when(b.get("start")) or datetime.now()
+    except sched.ScheduleError as e:
+        raise HTTPException(400, str(e))
+    slots = sched.next_slots(len(queue), config=_cfg(), taken=taken, start=start)
+
+    filled = []
+    for entry, when in zip(queue, slots):
+        entry["scheduled_at"] = sched.iso(when)
+        entry["status"] = "scheduled"
+        entry.setdefault("approved_at", datetime.now().isoformat(timespec="seconds"))
+        filled.append({"id": entry["id"], "when": entry["scheduled_at"],
+                       "title": entry.get("title", "")})
+    _review_save(items)
+    return {"ok": True, "scheduled": len(filled), "items": filled,
+            "unplaced": max(0, len(queue) - len(slots))}
+
+
+@app.get("/api/schedule/settings")
+async def api_schedule_settings():
+    """The posting-slot config the calendar auto-fill uses."""
+    import schedule as sched
+    return sched.slot_config(_cfg())
+
+
+@app.put("/api/schedule/settings")
+async def api_schedule_settings_save(body: dict = Body(...)):
+    """Persist posting times/days back to config.yaml."""
+    import schedule as sched
+    cfg = _cfg()
+    block = dict(cfg.get("schedule") or {})
+    if "times" in body:
+        times = [str(t).strip() for t in (body.get("times") or []) if str(t).strip()]
+        for t in times:
+            try:
+                hh, mm = t.split(":")
+                assert 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+            except (ValueError, AssertionError):
+                raise HTTPException(400, f"{t} is not a HH:MM time.")
+        block["times"] = times
+    if "days" in body:
+        block["days"] = [str(d).lower()[:3] for d in (body.get("days") or [])]
+    if "auto_publish" in body:
+        block["auto_publish"] = bool(body["auto_publish"])
+    cfg["schedule"] = block
+    Path("config.yaml").write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return sched.slot_config(cfg)
+
+
+# ── Background scheduler ──────────────────────────────────────────
+
+_scheduler_state: dict[str, Any] = {"last_tick": None, "last_error": "", "published": 0,
+                                    "last_blocked": "", "blocked": 0}
+
+
+def _sync_run_due() -> list[dict]:
+    """Publish every scheduled post whose slot has passed. Runs on the worker
+    thread because the Graph API calls block."""
+    import schedule as sched
+    items = _review_load()
+    due = [i for i in items if sched.is_due(i)]
+    if not due:
+        return []
+    out = []
+    for entry in due:
+        pub = _publish_entry(entry)
+        out.append({"id": entry.get("id"), "title": entry.get("title", ""),
+                    "status": entry.get("status"), "sent": bool(pub.get("sent")),
+                    "blocked": pub.get("blocked") or [],
+                    "error": pub.get("error", "") or pub.get("reason", "")})
+        title = (entry.get("title") or "")[:50]
+        if pub.get("blocked"):
+            # One line per distinct reason: a blocked post retries every tick and
+            # a log that repeats every minute is a log nobody reads.
+            key = f"{entry.get('id')}:{','.join(pub['blocked'])}"
+            if _scheduler_state.get("last_blocked") != key:
+                _scheduler_state["last_blocked"] = key
+                print(f"[scheduler] {title} -> BLOCKED ({', '.join(pub['blocked'])}): "
+                      f"{pub.get('reason', '')}")
+        else:
+            _scheduler_state["last_blocked"] = ""
+            print(f"[scheduler] {title} -> {entry.get('status')}")
+    _review_save(items)
+    return out
+
+
+async def _scheduler_loop() -> None:
+    """Tick forever, publishing due posts. Cheap when the queue is empty, and one
+    bad tick never kills the loop."""
+    import schedule as sched
+    while True:
+        cfg = sched.slot_config(_cfg())
+        await asyncio.sleep(max(15, cfg["tick_seconds"]))
+        _scheduler_state["last_tick"] = datetime.now().isoformat(timespec="seconds")
+        if not cfg["auto_publish"]:
+            continue
+        try:
+            done = await _run(_sync_run_due)
+            _scheduler_state["published"] += sum(1 for d in done if d["sent"])
+            _scheduler_state["last_error"] = ""
+        except Exception as e:                 # a bad tick must not stop the clock
+            _scheduler_state["last_error"] = str(e)
+            print(f"[scheduler] tick failed: {e}")
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    asyncio.create_task(_scheduler_loop())
+
+
+@app.get("/api/scheduler/status")
+async def api_scheduler_status():
+    import schedule as sched
+    items = _review_load()
+    upcoming = sorted((i for i in items if i.get("status") == "scheduled"),
+                      key=lambda i: i.get("scheduled_at") or "")
+    overdue = [i for i in upcoming if sched.is_due(i)]
+    return {**_scheduler_state, **sched.slot_config(_cfg()),
+            "scheduled": len(upcoming),
+            "overdue": len(overdue),
+            "blocked_reason": ((overdue[0].get("publish") or {}).get("reason", "")
+                               if overdue else ""),
+            "next": upcoming[0].get("scheduled_at") if upcoming else None}
+
+
+@app.post("/api/scheduler/run")
+async def api_scheduler_run():
+    """Publish anything already due, without waiting for the next tick."""
+    done = await _run(_sync_run_due)
+    return {"ok": True, "published": done}
+
+
+# ── Meta account status ───────────────────────────────────────────
+
+@app.get("/api/meta/status")
+async def api_meta_status():
+    """What the Review/Calendar tabs show about publishing readiness — config
+    only, no network call."""
+    import meta
+    cfg = meta.load_config(_cfg())
+    accounts = []
+    for key, acct in (cfg.get("accounts") or {}).items():
+        env_name = acct.get("token_env") or cfg.get("token_env")
+        accounts.append({
+            "brand": key,
+            "instagram": bool(acct.get("ig_user_id")),
+            "facebook": bool(acct.get("fb_page_id")),
+            "targets": acct.get("targets") or cfg["publish"].get("default_targets"),
+            "token_set": bool(os.environ.get(env_name, "").strip()),
+        })
+    return {
+        "configured": meta.configured(cfg),
+        "public_base_url": meta.public_base() or "",
+        "on_approve": cfg["publish"].get("on_approve", "hold"),
+        "app_credentials": meta.app_credentials_status(),
+        "accounts": accounts,
+    }
+
+
+@app.post("/api/meta/preflight")
+async def api_meta_preflight(body: dict = Body(default={})):
+    """Run every publishing constraint for one queued post (or a whole brand) and
+    return each check, so the UI can say exactly what is missing."""
+    import meta
+    rid = (body or {}).get("id", "")
+    entry = next((i for i in _review_load() if i.get("id") == rid), None) if rid else None
+
+    def _run_pre():
+        if entry:
+            paths, urls = _entry_assets(entry)
+            return meta.preflight(entry.get("brand") or "", ptype=_meta_type(entry),
+                                  assets=paths, asset_urls=urls,
+                                  caption=entry.get("caption", ""),
+                                  targets=entry.get("targets") or None,
+                                  config=_cfg(), network=True)
+        brand = (body or {}).get("brand", "") or ""
+        return meta.preflight(brand, config=_cfg(), network=True)
+
+    try:
+        return await _run(_run_pre)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/meta/test-post")
+async def api_meta_test_post(body: dict = Body(default={})):
+    """Publish one throwaway image to Instagram to prove the whole chain works.
+
+    Real account, real post — it is the only way to verify publishing end to end,
+    so it never runs on its own; the UI asks first."""
+    import meta
+
+    def _run_test():
+        return meta.test_post((body or {}).get("brand", "") or "",
+                              caption=(body or {}).get("caption", "") or "",
+                              config=_cfg(), dry_run=bool((body or {}).get("dry_run")))
+
+    try:
+        return await _run(_run_test)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/meta/verify")
+async def api_meta_verify(body: dict = Body(default={})):
+    """Live check against the Graph API: token validity, account names, quota."""
+    import meta
+
+    def _run_verify():
+        return meta.verify((body or {}).get("brand", ""), _cfg())
+
+    try:
+        return await _run(_run_verify)
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ── Autopilot (Layer 2): deterministic scheduled run, fed to the review queue ──
@@ -1591,117 +2356,6 @@ async def api_generate_scripts(body: dict = Body(...)):
         _release()
 
 
-# ── API: video / reels ────────────────────────────────────────────────────────
-@app.post("/api/video/generate")
-async def api_generate_video(body: dict = Body(...)):
-    youtube_url    = (body.get("youtube_url") or "").strip()
-    script         = body.get("script") or {}
-    rights_cleared = bool(body.get("rights_cleared"))
-    try:
-        start = float(body.get("start", 0))
-        end   = float(body.get("end", 0))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "start/end must be numbers (seconds).")
-    if not youtube_url:
-        raise HTTPException(400, "Provide a YouTube URL.")
-    if end <= start:
-        raise HTTPException(400, "End time must be after start time.")
-    if not rights_cleared:
-        raise HTTPException(403, "Confirm you have the rights to use this clip "
-                                 "(fair use / licensed) before extracting.")
-    _apply_brand(body.get("brand"))
-    from brands import active_key
-    brand_key = body.get("brand") or active_key(_cfg())
-    _acquire("generate video")
-    t0 = time.time()
-    try:
-        res = await _run(_sync_video_generate, youtube_url, start, end,
-                         rights_cleared, script, brand_key)
-        res["elapsed"] = round(time.time() - t0, 1)
-        return res
-    except HTTPException:
-        raise
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        _release()
-
-
-# ── video_reels mode: analyze → editable manifest → render → Postiz ─────────────
-_VR_UI_MANIFEST = Path("library/manifests/_ui.json")
-
-
-def _sync_vr_analyze(url, rss, mode, aspect, clip_method, brand_key):
-    import video_reels as vr
-    _VR_UI_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    m = vr.emit_manifest(rss=rss or "", url=url or "", mode=mode, aspect=aspect,
-                         clip_method=clip_method, out_path=str(_VR_UI_MANIFEST),
-                         brand_key=brand_key or None)
-    m["source"]["rights_cleared"] = True   # using the tool asserts your rights
-    _VR_UI_MANIFEST.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
-    return m
-
-
-def _sync_vr_render(manifest, send):
-    import video_reels as vr
-    _VR_UI_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    _VR_UI_MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return vr.render_from_manifest(str(_VR_UI_MANIFEST), send=send)
-
-
-@app.post("/api/vreels/analyze")
-async def api_vreels_analyze(body: dict = Body(...)):
-    """Resolve a YouTube source, write the AI copy + auto-picked clips into an
-    editable manifest, and return it. No render yet."""
-    url  = (body.get("url") or "").strip()
-    rss  = (body.get("rss") or "").strip()
-    if not (url or rss):
-        raise HTTPException(400, "Provide a YouTube URL (or an RSS feed).")
-    mode    = body.get("mode", "reel")
-    aspect  = body.get("aspect", "9:16")
-    method  = body.get("clip_method", "even_intervals")
-    _apply_brand(body.get("brand"))
-    from brands import active_key
-    bkey = body.get("brand") or active_key(_cfg())
-    _acquire("analyze video")
-    t0 = time.time()
-    try:
-        m = await _run(_sync_vr_analyze, url, rss, mode, aspect, method, bkey)
-        return {"manifest": m, "elapsed": round(time.time() - t0, 1)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        _release()
-
-
-@app.post("/api/vreels/render")
-async def api_vreels_render(body: dict = Body(...)):
-    """Render the (edited) manifest to branded clips/reel, optionally pushing a
-    Postiz draft. Returns preview URLs under /video_cache."""
-    manifest = body.get("manifest")
-    if not manifest:
-        raise HTTPException(400, "No manifest to render.")
-    send = bool(body.get("send"))
-    _acquire("render video")
-    t0 = time.time()
-    try:
-        res = await _run(_sync_vr_render, manifest, send)
-        res["assets_url"] = ["/video_cache/" + Path(a).relative_to("video_cache").as_posix()
-                             for a in res.get("assets", [])]
-        res["elapsed"] = round(time.time() - t0, 1)
-        return res
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        _release()
-
-
 @app.get("/api/plan")
 async def api_get_plan():
     if not _session["plan"]:
@@ -2181,6 +2835,46 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 .rv-status.published{background:rgba(0,200,150,.15);color:var(--green);}
 .rv-status.approved{background:rgba(0,180,200,.15);color:var(--teal);}
 .rv-status.rejected{background:rgba(224,82,82,.15);color:var(--red);}
+.rv-status.scheduled{background:rgba(150,120,255,.18);color:#a78bfa;}
+.rv-status.failed{background:rgba(224,82,82,.22);color:var(--red);}
+.rv-blocked{margin-top:6px;font-size:11.5px;line-height:1.5;color:var(--yellow);
+  background:rgba(245,197,66,.09);border-left:3px solid var(--yellow);
+  padding:6px 9px;border-radius:0 6px 6px 0;}
+.rv-blocked a{color:var(--yellow);margin-left:6px;}
+.rv-when{font-size:11px;color:#a78bfa;font-weight:600;white-space:nowrap;}
+/* Post calendar — a fixed 7-column month grid; each day scrolls its own chips. */
+.cal-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.cal-head{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--border);}
+.cal-head div{padding:7px 8px;font-size:10.5px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;text-align:center;}
+.cal-grid{flex:1;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:minmax(104px,1fr);overflow-y:auto;}
+.cal-day{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:5px 6px;display:flex;flex-direction:column;gap:4px;min-width:0;min-height:104px;}
+.cal-day.out{background:rgba(0,0,0,.18);}
+.cal-day.today{background:rgba(0,180,200,.07);}
+.cal-day:hover{background:rgba(255,255,255,.035);}
+.cal-daynum{font-size:11px;font-weight:700;color:var(--muted);display:flex;align-items:center;gap:5px;}
+.cal-day.today .cal-daynum{color:var(--teal);}
+.cal-add{margin-left:auto;opacity:0;background:none;border:none;color:var(--teal);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;font-family:inherit;}
+.cal-day:hover .cal-add{opacity:1;}
+.cal-chips{display:flex;flex-direction:column;gap:3px;overflow-y:auto;min-height:0;}
+.cal-chip{display:flex;align-items:center;gap:5px;background:#0d1828;border:1px solid var(--border);border-left:3px solid var(--teal);border-radius:5px;padding:3px 6px;font-size:10.5px;cursor:pointer;text-align:left;color:var(--text);font-family:inherit;width:100%;min-width:0;}
+.cal-chip:hover{border-color:var(--teal);}
+.cal-chip.published{border-left-color:var(--green);opacity:.72;}
+.cal-chip.failed{border-left-color:var(--red);}
+.cal-chip .t{font-weight:700;color:var(--muted);flex-shrink:0;}
+.cal-chip .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+.cal-unsched{border-top:1px solid var(--border);background:var(--panel);padding:8px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-height:130px;overflow-y:auto;flex-shrink:0;}
+.cal-pill{display:flex;align-items:center;gap:6px;background:#0d1828;border:1px solid var(--border);border-radius:20px;padding:4px 11px;font-size:11.5px;cursor:pointer;color:var(--text);font-family:inherit;max-width:280px;}
+.cal-pill:hover{border-color:var(--teal);}
+.cal-pill span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+/* CSV import — mapping preview table + per-row post cards. */
+.csv-table{width:100%;border-collapse:collapse;font-size:11.5px;}
+.csv-table th{position:sticky;top:0;background:#0d1828;color:var(--muted);font-weight:700;text-align:left;padding:6px 9px;border-bottom:1px solid var(--border);white-space:nowrap;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;}
+.csv-table td{padding:6px 9px;border-bottom:1px solid var(--border);vertical-align:top;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);}
+.csv-scroll{overflow:auto;max-height:300px;border:1px solid var(--border);border-radius:8px;background:var(--panel);}
+.csv-drop{border:2px dashed var(--border);border-radius:12px;padding:30px 20px;text-align:center;cursor:pointer;transition:all .15s;background:var(--panel);}
+.csv-drop:hover,.csv-drop.over{border-color:var(--teal);background:rgba(0,180,200,.06);}
+.csv-slide{background:#0d1828;border:1px solid var(--border);border-radius:6px;padding:7px 9px;font-size:11.5px;}
+.csv-slide b{color:var(--teal);font-size:10.5px;letter-spacing:.4px;}
 .story-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 18px;cursor:pointer;transition:border-color .15s;}
 .story-card:hover{border-color:var(--teal);}
 .story-card.selected{border-color:var(--teal);background:#0d1e2e;}
@@ -2632,6 +3326,63 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     min-height:58vh;
   }
 }
+
+/* Modern dashboard shell */
+:root{
+  --navy:#07101f;--panel:#0d1829;--panel-2:#111f33;--border:#23334b;
+  --text:#edf3fb;--muted:#8da0ba;--teal:#39d0c3;--green:#47d7a1;
+}
+body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at 78% -10%,rgba(57,208,195,.10),transparent 30%),var(--navy);}
+.sidebar{width:236px;flex-basis:236px;background:rgba(8,17,31,.94);border-right-color:rgba(141,160,186,.15);padding:10px;}
+.sidebar-logo{border:0;padding:13px 12px 18px;}
+nav{padding:0;gap:3px;}
+.nav-section{padding:18px 12px 7px;color:#60738f;letter-spacing:1.2px;}
+.nav-btn{padding:10px 12px;border-radius:10px;color:#91a3bb;font-weight:600;}
+.nav-btn:hover{background:rgba(255,255,255,.055);}
+.nav-btn.active{background:linear-gradient(135deg,rgba(57,208,195,.20),rgba(57,208,195,.08));color:#75eee2;box-shadow:inset 0 0 0 1px rgba(57,208,195,.18);}
+.header-right{border-top-color:rgba(141,160,186,.14);padding:14px 4px 4px;}
+.model-sel,.src-sel,.url-inp{border-color:#2b3b52!important;background:#0a1424!important;border-radius:9px!important;}
+.btn{border-radius:9px;font-weight:700;letter-spacing:-.1px;}
+.btn-primary{background:linear-gradient(135deg,#42dbd0,#23b7b2);color:#05201f;border:0;}
+.btn-green{background:linear-gradient(135deg,#4adea8,#27bd8b);color:#042016;border:0;}
+.story-card,.rv-card,.lib-card,.lib-row,.bulk-col{border-radius:14px;background:linear-gradient(145deg,rgba(17,31,51,.96),rgba(11,22,38,.96));box-shadow:0 12px 34px rgba(0,0,0,.16);}
+
+#tab-dashboard{display:none;overflow-y:auto;flex-direction:column;background:linear-gradient(180deg,rgba(17,30,49,.42),transparent 45%);}
+#tab-dashboard.active{display:flex;}
+.dash-wrap{width:100%;max-width:1500px;margin:0 auto;padding:30px clamp(18px,3vw,42px) 56px;}
+.dash-hero{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:28px;}
+.dash-eyebrow{color:var(--teal);font-size:11px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;}
+.dash-title{font-size:clamp(27px,3vw,42px);line-height:1.08;color:#fff;letter-spacing:-1.5px;max-width:700px;}
+.dash-subtitle{color:var(--muted);font-size:14px;line-height:1.6;margin-top:10px;max-width:680px;}
+.dash-actions{display:flex;gap:9px;flex-wrap:wrap;justify-content:flex-end;}
+.dash-actions .btn{padding:10px 15px;}
+.dash-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px;}
+.dash-stat{position:relative;overflow:hidden;background:linear-gradient(145deg,rgba(17,31,51,.98),rgba(10,22,38,.98));border:1px solid rgba(141,160,186,.16);border-radius:16px;padding:18px;min-height:108px;}
+.dash-stat::after{content:"";position:absolute;width:90px;height:90px;border-radius:50%;right:-38px;top:-38px;background:var(--stat-color,rgba(57,208,195,.14));filter:blur(1px);}
+.dash-stat-label{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.8px;}
+.dash-stat-value{font-size:30px;font-weight:800;color:#fff;letter-spacing:-1px;margin-top:10px;}
+.dash-stat-note{font-size:11px;color:#6f849e;margin-top:3px;}
+.dash-section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:4px 0 14px;}
+.dash-section-head h2{font-size:18px;color:#fff;letter-spacing:-.4px;}
+.dash-section-head p{font-size:12px;color:var(--muted);margin-top:4px;}
+.dash-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;}
+.post-card{background:linear-gradient(160deg,#12223a,#0a1526);border:1px solid rgba(141,160,186,.17);border-radius:18px;overflow:hidden;min-width:0;box-shadow:0 18px 44px rgba(0,0,0,.20);transition:transform .2s,border-color .2s;}
+.post-card:hover{transform:translateY(-3px);border-color:rgba(57,208,195,.42);}
+.post-cover{aspect-ratio:4/5;background:#101c2d;overflow:hidden;position:relative;}
+.post-cover>img{width:100%;height:100%;object-fit:cover;display:block;}
+.post-count{position:absolute;right:10px;top:10px;background:rgba(4,10,18,.82);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:5px 8px;color:#fff;font-size:10px;font-weight:800;}
+.post-body{padding:15px;}
+.post-meta{display:flex;align-items:center;gap:7px;margin-bottom:9px;}
+.post-brand{font-size:10px;color:var(--teal);font-weight:800;text-transform:uppercase;letter-spacing:.8px;}
+.post-title{font-size:14px;color:#fff;font-weight:750;line-height:1.35;min-height:38px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.post-caption{font-size:11px;color:var(--muted);line-height:1.45;margin-top:8px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:48px;}
+.post-when{font-size:10.5px;color:#b3c1d4;margin-top:12px;padding-top:11px;border-top:1px solid rgba(141,160,186,.12);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.post-actions{display:flex;gap:7px;margin-top:12px;}
+.post-actions .btn{flex:1;justify-content:center;padding:7px 9px;font-size:11px;}
+.dash-empty{grid-column:1/-1;border:1px dashed #2b3d57;border-radius:18px;text-align:center;padding:56px 20px;color:var(--muted);background:rgba(13,24,41,.55);}
+.dash-empty strong{display:block;color:#fff;font-size:16px;margin-bottom:6px;}
+@media(max-width:1180px){.dash-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.post-cover{aspect-ratio:16/10;}.dash-stats{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:720px){.dash-wrap{padding:22px 14px 40px}.dash-hero{align-items:flex-start;flex-direction:column}.dash-actions{justify-content:flex-start}.dash-grid{grid-template-columns:1fr}.dash-stats{grid-template-columns:repeat(2,1fr)}.post-cover{aspect-ratio:16/11}.sidebar{padding:8px}.dash-title{font-size:29px}}
 </style>
 </head>
 <body>
@@ -2643,19 +3394,19 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     </div>
   </div>
   <nav>
-    <div class="nav-section">Posts</div>
-    <button class="nav-btn active" onclick="showTab('create',this)">✍️ Create</button>
+    <div class="nav-section">Workspace</div>
+    <button class="nav-btn active" onclick="showTab('dashboard',this)">⌂ Dashboard</button>
+    <button class="nav-btn"       onclick="showTab('create',this)">＋ Create post</button>
+    <div class="nav-section">Content</div>
     <button class="nav-btn"       onclick="showTab('stories',this)">📡 Auto (RSS)</button>
     <button class="nav-btn"       onclick="showTab('bulk',this)">⚡ Bulk</button>
+    <button class="nav-btn"       onclick="showTab('csv',this)">📄 CSV Import</button>
     <button class="nav-btn"       onclick="showTab('agent',this)">🤖 Agent</button>
     <button class="nav-btn"       onclick="showTab('review',this)">✅ Review<span id="review-badge" class="nav-badge" style="display:none;">0</span></button>
-    <button class="nav-btn"       onclick="showTab('editor',this)">🎨 Editor</button>
+    <button class="nav-btn"       onclick="showTab('calendar',this)">🗓 Calendar<span id="cal-badge" class="nav-badge" style="display:none;">0</span></button>
     <button class="nav-btn"       onclick="showTab('canvas',this)">🖌 Canvas</button>
     <button class="nav-btn"       onclick="showTab('templates',this)">📄 Templates</button>
     <button class="nav-btn"       onclick="showTab('library',this)">📚 Library</button>
-    <div class="nav-section">Video</div>
-    <button class="nav-btn"       onclick="showTab('vcreate',this)">✨ Create Video</button>
-    <button class="nav-btn"       onclick="showTab('video',this)">🎬 Reels / Video</button>
     <div class="nav-section">Scripts</div>
     <button class="nav-btn"       onclick="showTab('scripts',this)">📝 Scripts</button>
   </nav>
@@ -2706,8 +3457,41 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 
 <div class="main">
 
+<!-- Dashboard -->
+<div id="tab-dashboard" class="tab active">
+  <div class="dash-wrap">
+    <section class="dash-hero">
+      <div>
+        <div class="dash-eyebrow">Content operations</div>
+        <h1 class="dash-title">Your social content,<br>ready in one place.</h1>
+        <p class="dash-subtitle">Review the latest four carousel packages, see what is ready or scheduled, and hand everything off with one download.</p>
+      </div>
+      <div class="dash-actions">
+        <button class="btn btn-ghost" onclick="showTab('calendar')">View calendar</button>
+        <button class="btn btn-ghost" onclick="showTab('review')">Open review</button>
+        <button class="btn btn-primary" id="dash-export" onclick="exportDashboard()">↓ Export all 4</button>
+      </div>
+    </section>
+    <section class="dash-stats" aria-label="Content summary">
+      <div class="dash-stat" style="--stat-color:rgba(57,208,195,.17)"><div class="dash-stat-label">All posts</div><div class="dash-stat-value" id="dash-total">—</div><div class="dash-stat-note">in this brand workspace</div></div>
+      <div class="dash-stat" style="--stat-color:rgba(245,197,66,.15)"><div class="dash-stat-label">Awaiting review</div><div class="dash-stat-value" id="dash-pending">—</div><div class="dash-stat-note">need a decision</div></div>
+      <div class="dash-stat" style="--stat-color:rgba(167,139,250,.16)"><div class="dash-stat-label">Scheduled</div><div class="dash-stat-value" id="dash-scheduled">—</div><div class="dash-stat-note">on the publishing calendar</div></div>
+      <div class="dash-stat" style="--stat-color:rgba(71,215,161,.16)"><div class="dash-stat-label">Published</div><div class="dash-stat-value" id="dash-published">—</div><div class="dash-stat-note">successfully delivered</div></div>
+    </section>
+    <section>
+      <div class="dash-section-head">
+        <div><h2>Latest carousel pack</h2><p>Four complete posts with images, caption, and timing instructions.</p></div>
+        <button class="btn btn-ghost btn-sm" onclick="loadDashboard()">↻ Refresh</button>
+      </div>
+      <div class="dash-grid" id="dash-posts">
+        <div class="dash-empty"><strong>Loading your carousels…</strong>Preparing the latest content pack.</div>
+      </div>
+    </section>
+  </div>
+</div>
+
 <!-- ═══════════ CREATE (MANUAL) ═══════════════════════════════════════════ -->
-<div id="tab-create" class="tab active">
+<div id="tab-create" class="tab">
   <div class="stories-toolbar" style="flex-wrap:wrap;">
     <b style="font-size:14px;color:#fff;">✍️ Create a post</b>
     <span class="tb-hint" style="font-size:11px;color:var(--muted);">Choose the platform and purpose, then give your idea and key points — the AI shapes the post for that audience.</span>
@@ -2715,7 +3499,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
   <div style="flex:1;overflow-y:auto;padding:22px;display:flex;justify-content:center;">
     <div style="width:100%;max-width:640px;display:flex;flex-direction:column;gap:16px;">
 
-      <button class="btn btn-danger btn-sm" onclick="clearCreateSession()" style="align-self:flex-end;" title="Clear this brand's current Create and Editor session">Start fresh</button>
+      <button class="btn btn-danger btn-sm" onclick="clearCreateSession()" style="align-self:flex-end;" title="Clear this brand's current working session">Start fresh</button>
 
       <div class="field-group">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -2780,7 +3564,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       </div>
 
       <button class="btn btn-green" id="m-gen" onclick="manualGenerate()" style="align-self:flex-start;font-size:14px;padding:11px 22px;">✨ Generate post</button>
-      <div style="font-size:11px;color:var(--muted);">It opens in the Editor with platform-appropriate copy, caption, hashtags and per-slide image suggestions — tweak anything, then Render &amp; Send to Review.</div>
+      <div style="font-size:11px;color:var(--muted);">The post is written, illustrated, rendered, and added to Review automatically. It will appear on the Dashboard when ready.</div>
     </div>
   </div>
 </div>
@@ -2889,21 +3673,115 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 <div id="tab-review" class="tab">
   <div class="stories-toolbar" style="flex-wrap:wrap;">
     <b style="font-size:14px;color:#fff;">✅ Review &amp; publish</b>
-    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Approve to publish as a Postiz draft (or n8n); reject to discard. Agent &amp; autopilot posts land here.</span>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Approve, then schedule on the calendar or publish straight to Instagram / Facebook.</span>
     <div class="tb-spacer"></div>
+    <span id="meta-status" style="font-size:11px;"></span>
     <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Show</span>
     <select id="review-filter" class="src-sel" onchange="loadReview()">
       <option value="pending">Pending</option>
       <option value="">All</option>
       <option value="approved">Approved</option>
+      <option value="scheduled">Scheduled</option>
       <option value="published">Published</option>
+      <option value="failed">Failed</option>
       <option value="rejected">Rejected</option>
     </select></label>
     <button class="btn btn-ghost btn-sm" onclick="loadReview()">↻ Refresh</button>
-    <button class="btn btn-ghost btn-sm" onclick="showChannelHelp()" title="How to connect Instagram &amp; add more channels">📖 Add channels</button>
+    <button class="btn btn-ghost btn-sm" onclick="showChannelHelp()" title="How to connect Instagram &amp; Facebook">📖 Connect accounts</button>
     <button class="btn btn-danger btn-sm" onclick="clearReview()" title="Remove rejected entries">🗑 Clear rejected</button>
   </div>
   <div id="review-list" class="stories-list"></div>
+</div>
+
+<!-- ═══════════ CALENDAR ═════════════════════════════════════════════════ -->
+<div id="tab-calendar" class="tab" style="flex-direction:column;">
+  <div class="stories-toolbar" style="flex-wrap:wrap;gap:8px;">
+    <b style="font-size:14px;color:#fff;">🗓 Calendar</b>
+    <div class="tb-group" style="gap:4px;">
+      <button class="btn btn-ghost btn-sm" onclick="calShift(-1)" title="Previous month">◀</button>
+      <b id="cal-label" style="font-size:13px;color:#fff;min-width:132px;text-align:center;">…</b>
+      <button class="btn btn-ghost btn-sm" onclick="calShift(1)" title="Next month">▶</button>
+      <button class="btn btn-ghost btn-sm" onclick="calGoToday()">Today</button>
+    </div>
+    <div class="tb-spacer"></div>
+    <span id="cal-sched-status" style="font-size:11px;color:var(--muted);"></span>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Brand</span>
+      <select id="cal-brand" class="src-sel" onchange="loadCalendar()">
+        <option value="">All brands</option>
+      </select></label>
+    <button class="btn btn-primary btn-sm" onclick="calAutofill()" title="Drop every unscheduled post into the next free posting slots">✨ Auto-fill slots</button>
+    <button class="btn btn-ghost btn-sm" onclick="calSettings()" title="Posting times &amp; days">⚙ Slots</button>
+    <button class="btn btn-ghost btn-sm" onclick="loadCalendar()">↻</button>
+  </div>
+  <div class="cal-wrap">
+    <div class="cal-head" id="cal-head"></div>
+    <div class="cal-grid" id="cal-grid">
+      <div style="grid-column:1/-1;color:var(--muted);padding:40px;text-align:center;font-size:13px;">Loading…</div>
+    </div>
+  </div>
+  <div class="cal-unsched" id="cal-unsched" style="display:none;"></div>
+</div>
+
+<!-- ═══════════ CSV IMPORT ═══════════════════════════════════════════════ -->
+<div id="tab-csv" class="tab" style="flex-direction:column;">
+  <div class="stories-toolbar" style="flex-wrap:wrap;gap:8px;">
+    <b style="font-size:14px;color:#fff;">📄 CSV Import</b>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">One row per post (or per slide) → carousels, straight into Review.</span>
+    <div class="tb-spacer"></div>
+    <a class="btn btn-ghost btn-sm" href="/api/csv/template" download>⬇ Template CSV</a>
+    <button class="btn btn-ghost btn-sm" onclick="csvHelp()">📖 Columns</button>
+  </div>
+  <div style="flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:14px;">
+    <div class="csv-drop" id="csv-drop" onclick="g('csv-file').click()">
+      <div style="font-size:32px;margin-bottom:8px;">📄</div>
+      <div style="font-size:14px;color:#fff;font-weight:600;">Drop a CSV here, or click to choose one</div>
+      <div style="font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.6;">
+        Columns are matched loosely — <code>title</code>, <code>slide1_heading</code>,
+        <code>slide1_body</code>, <code>cta</code>, <code>caption</code>, <code>hashtags</code>,
+        <code>image_query</code>, <code>schedule</code>.<br>
+        A <code>post_id</code> + <code>order</code> sheet (one row per slide) works too.
+      </div>
+      <input type="file" id="csv-file" accept=".csv,text/csv" style="display:none;" onchange="csvUpload(this.files[0])">
+    </div>
+    <div id="csv-summary"></div>
+    <div id="csv-controls" style="display:none;">
+      <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;">
+        <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;">
+          <span style="font-size:11px;color:var(--muted);">Copy</span>
+          <select id="csv-mode" class="src-sel" title="Use the sheet text as-is, or let the AI write from each row">
+            <option value="direct">Use my text as-is</option>
+            <option value="ai">AI writes from each row</option>
+          </select></label>
+        <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;">
+          <span style="font-size:11px;color:var(--muted);">Format</span>
+          <select id="csv-format" class="src-sel">
+            <option value="carousel">Carousel</option>
+            <option value="listicle">Listicle</option>
+            <option value="square">Square</option>
+            <option value="story">Story</option>
+            <option value="quote">Quote</option>
+          </select></label>
+        <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;">
+          <span style="font-size:11px;color:var(--muted);">Images</span>
+          <select id="csv-source" class="src-sel">
+            <option value="pexels">Pexels</option>
+            <option value="unsplash">Unsplash</option>
+            <option value="google">Google</option>
+            <option value="none">None (fast)</option>
+          </select></label>
+        <label class="tb-group" style="align-self:center;gap:6px;">
+          <input type="checkbox" id="csv-enqueue" checked>
+          <span style="font-size:12px;">Send to Review</span></label>
+        <label class="tb-group" style="align-self:center;gap:6px;">
+          <input type="checkbox" id="csv-autoschedule">
+          <span style="font-size:12px;" title="Place them on the calendar in the next free posting slots">Auto-schedule</span></label>
+        <div class="tb-spacer" style="flex:1;"></div>
+        <button class="btn btn-primary" id="csv-gen" onclick="csvGenerate()">⚡ Generate posts</button>
+      </div>
+    </div>
+    <div id="csv-preview"></div>
+    <div id="csv-results" class="stories-list" style="padding:0;gap:12px;"></div>
+  </div>
 </div>
 
 <!-- ═══════════ LIBRARY ══════════════════════════════════════════════════ -->
@@ -3009,74 +3887,6 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
   </div>
 </div>
 
-<!-- ═══════════ VIDEO ════════════════════════════════════════════════════ -->
-<!-- ═══════════ VIDEO CREATE (video_reels) ═══════════════════════════════════ -->
-<div id="tab-vcreate" class="tab" style="flex-direction:column;">
-  <div class="stories-toolbar" style="flex-wrap:wrap;gap:10px;">
-    <b style="font-size:14px;color:#fff;">✨ Create Video</b>
-    <input id="vc-url" class="url-inp" placeholder="Paste a YouTube URL…" style="flex:1;min-width:220px;">
-    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Output</span>
-      <select id="vc-mode" class="src-sel" onchange="vcModeChanged()">
-        <option value="reel">Reel (9:16)</option>
-        <option value="carousel">Carousel</option>
-      </select></label>
-    <label class="tb-group" id="vc-aspect-wrap" style="display:none;"><span style="font-size:11px;color:var(--muted);">Aspect</span>
-      <select id="vc-aspect" class="src-sel">
-        <option value="9:16">9:16</option><option value="4:5" selected>4:5</option>
-        <option value="1:1">1:1</option><option value="16:9">16:9</option>
-      </select></label>
-    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Clips</span>
-      <select id="vc-method" class="src-sel">
-        <option value="even_intervals">Even</option><option value="scene_cut">Scene-cut</option>
-      </select></label>
-    <button class="btn btn-primary" id="vc-analyze" onclick="vcAnalyze()">🔎 Analyze</button>
-  </div>
-  <div id="vc-body" class="stories-list" style="padding:14px;gap:14px;">
-    <div style="color:var(--muted);font-size:13px;text-align:center;padding:40px 20px;line-height:1.6;">
-      <div style="font-size:34px;margin-bottom:10px;">✨</div>
-      Paste a YouTube URL and <b>Analyze</b> — the AI writes the hook / title / CTA copy and
-      auto-picks the clip moments. Then tweak the clips, copy, and framing, and <b>Render</b> →
-      <b>Send to Postiz</b>.
-    </div>
-  </div>
-</div>
-
-<div id="tab-video" class="tab" style="flex-direction:column;">
-  <div class="stories-toolbar" style="flex-wrap:wrap;gap:8px;">
-    <b style="font-size:14px;color:#fff;">🎬 Reels / Video</b>
-    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Clip a YouTube segment + overlay a script → branded 9:16 MP4 (captions, grade, hook &amp; end cards).</span>
-  </div>
-  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;">
-    <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;flex:1 1 320px;">
-      <span style="font-size:11px;color:var(--muted);">YouTube URL</span>
-      <input id="vid-url" class="model-sel" style="width:100%;" placeholder="https://www.youtube.com/watch?v=…">
-    </label>
-    <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;">
-      <span style="font-size:11px;color:var(--muted);">Start (s)</span>
-      <input id="vid-start" class="model-sel" type="number" min="0" value="0" style="width:90px;">
-    </label>
-    <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;">
-      <span style="font-size:11px;color:var(--muted);">End (s)</span>
-      <input id="vid-end" class="model-sel" type="number" min="1" value="30" style="width:90px;">
-    </label>
-    <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;flex:1 1 240px;">
-      <span style="font-size:11px;color:var(--muted);">Script (from the Scripts tab)</span>
-      <select id="vid-script" class="model-sel" style="width:100%;"><option value="">— No captions / cards from script —</option></select>
-    </label>
-  </div>
-  <div style="padding:10px 18px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
-    <div class="tb-spacer" style="flex:1;"></div>
-    <button class="btn btn-primary" id="btn-vid-gen" onclick="generateVideo()">🎬 Generate reel</button>
-  </div>
-  <div id="video-result" class="stories-list" style="align-items:center;">
-    <div style="color:var(--muted);font-size:13px;text-align:center;padding:40px 20px;line-height:1.6;">
-      <div style="font-size:34px;margin-bottom:10px;">🎬</div>
-      Paste a YouTube URL, set start/end, and <b>Generate reel</b>.<br>
-      <span style="font-size:11px;">First run downloads the clip — give it a moment.</span>
-    </div>
-  </div>
-</div>
-
 <!-- ═══════════ EDITOR ═══════════════════════════════════════════════════ -->
 <div id="tab-editor" class="tab">
   <div class="editor-left">
@@ -3140,8 +3950,8 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     <div>
       <h4>From current plan</h4>
       <div class="preset-btns" style="margin-top:6px;">
-        <button class="btn btn-primary btn-sm" style="justify-content:flex-start;" onclick="loadSlideToCanvas()">Load Editor Slide</button>
-        <span style="font-size:10px;color:var(--muted);line-height:1.4;">Mirrors the slide open in the Editor (real text + image) so you can tweak it visually, then export.</span>
+        <button class="btn btn-primary btn-sm" style="justify-content:flex-start;" onclick="loadSlideToCanvas()">Load generated slide</button>
+        <span style="font-size:10px;color:var(--muted);line-height:1.4;">Loads a slide from the latest generated plan into the canvas.</span>
       </div>
     </div>
     <div>
@@ -3316,6 +4126,11 @@ let S = {
   results: [],            // last batch/bulk results (for ✨ Suggest / re-render)
   scripts: [],            // last generated script variants
   lib: { kind: 'plans', view: 'grid', plans: [], stories: [] },  // Library tab state
+  cal: null,              // last /api/calendar payload {year, month, weeks, undated}
+  calItems: [],           // every post on the visible month, for the detail modal
+  reviewItems: [],        // last /api/review payload, for the schedule modal
+  csv: null,              // last CSV preview {posts, mapping, shape, ...}
+  meta: null,             // /api/meta/status — publishing readiness
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3378,6 +4193,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   await Promise.all([loadModels(), loadCategories(), loadFormats()]);
   applySettings();          // apply saved defaults now that controls/options exist
   await restoreSession();
+  await loadDashboard();
   refreshReviewBadge();     // show any pending posts awaiting review
   restoreActiveTab();       // re-open the last tab after a refresh
   refreshResponsiveSurfaces();
@@ -3432,6 +4248,7 @@ async function loadBrands() {
   if (!entries.length) { sel.innerHTML = '<option>—</option>'; return; }
   sel.innerHTML = entries.map(([k, name]) =>
     `<option value="${k}" ${k === data.active ? 'selected' : ''}>${esc(name)}</option>`).join('');
+  syncCalBrands();
   applyBrandChrome(await api('/api/brand').catch(() => null));
 }
 
@@ -3491,6 +4308,7 @@ async function switchBrand(key) {
            Pick a story → plan loads here.</div>`;
     }
     await Promise.all([loadCategories(true), loadFormats()]);
+    await loadDashboard();
     toast(`Brand: ${b.name}`);
   } catch(e) { toast(e.message, 'err'); }
 }
@@ -3640,6 +4458,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleNav(fa
 // Tabs
 // ═══════════════════════════════════════════════════════════════════════════
 function showTab(name, btn) {
+  if (name === 'editor') name = 'dashboard';
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
@@ -3653,9 +4472,11 @@ function showTab(name, btn) {
   if (name === 'bulk' && !window._bulkInit) { window._bulkInit = true; initBulk(); }
   if (name === 'agent') { renderAgentSuggestions(); const t = g('agent-text'); if (t) setTimeout(() => t.focus(), 60); }
   if (name === 'scripts') refreshScriptStorySelect();
-  if (name === 'video') refreshVideoScriptSelect();
   if (name === 'review') loadReview();
+  if (name === 'calendar') { syncCalBrands(); loadCalendar(); }
+  if (name === 'csv') initCsvDrop();
   if (name === 'create') renderManualImages();
+  if (name === 'dashboard') loadDashboard();
   try { localStorage.setItem('k2_active_tab', name); } catch(e) {}   // remember across refresh
   toggleNav(false);   // collapse the mobile drawer after picking a tab
   requestAnimationFrame(refreshResponsiveSurfaces);
@@ -3663,11 +4484,8 @@ function showTab(name, btn) {
 
 // Re-open the tab the user was last on (survives a page refresh).
 function restoreActiveTab() {
-  let name = '';
-  try { name = localStorage.getItem('k2_active_tab') || ''; } catch(e) {}
-  if (!name || name === 'create') return;            // Create is the default landing
-  const btn = document.querySelector(`.nav-btn[onclick*="showTab('${name}'"]`);
-  if (btn) showTab(name, btn);
+  // The dashboard is intentionally the front door on every fresh visit.
+  try { localStorage.setItem('k2_active_tab', 'dashboard'); } catch(e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3820,158 +4638,326 @@ function copyScript(i) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Video / Reels — clip a YouTube segment + overlay a script (/api/video/generate)
+// Post calendar — the queue laid out by scheduled date (/api/calendar)
 // ═══════════════════════════════════════════════════════════════════════════
-function refreshVideoScriptSelect() {
-  const sel = g('vid-script'); if (!sel) return;
-  const cur = sel.value;
-  const opts = ['<option value="">— No captions / cards from script —</option>'].concat(
-    (S.scripts || []).map((s, i) => `<option value="${i}">${esc(s.angle)} · ${esc(s.platform)} · ~${s.duration_seconds}s</option>`)
-  );
-  sel.innerHTML = opts.join('');
-  if (cur && S.scripts && S.scripts[cur]) sel.value = cur;
-  // If a script is picked, sync the End field to its duration as a convenience.
-  if (S.scripts && S.scripts.length && sel.value === '' ) sel.value = '0';
+const CAL_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+function calShift(delta) {
+  const c = S.cal || {};
+  let y = c.year, m = c.month + delta;
+  if (m < 1) { m = 12; y--; } else if (m > 12) { m = 1; y++; }
+  loadCalendar(y, m);
 }
 
-// ── Video Create (video_reels): analyze → edit manifest → render → Postiz ──────
-function vcModeChanged() {
-  const reel = g('vc-mode').value === 'reel';
-  g('vc-aspect-wrap').style.display = reel ? 'none' : '';   // reels = full 9:16
+function calGoToday() {
+  const n = new Date();
+  loadCalendar(n.getFullYear(), n.getMonth() + 1);
 }
 
-async function vcAnalyze() {
-  if (S.busy) { toast(`Wait — '${S.busy}' is running`, 'err'); return; }
-  const url = g('vc-url').value.trim();
-  if (!url) { toast('Paste a YouTube URL', 'err'); return; }
-  const mode = g('vc-mode').value;
-  const aspect = mode === 'reel' ? '9:16' : g('vc-aspect').value;
-  const btn = g('vc-analyze'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Analyzing…';
-  S.busy = 'analyze video';
+async function loadCalendar(year, month) {
+  const grid = g('cal-grid'); if (!grid) return;
+  const c = S.cal || {};
+  year = year || c.year || new Date().getFullYear();
+  month = month || c.month || (new Date().getMonth() + 1);
+  const brand = g('cal-brand') ? g('cal-brand').value : '';
+
+  g('cal-head').innerHTML = CAL_DAYS.map(d => `<div>${d}</div>`).join('');
+  grid.innerHTML = '<div style="grid-column:1/-1;color:var(--muted);padding:40px;text-align:center;font-size:13px;">Loading…</div>';
   try {
-    const data = await api('/api/vreels/analyze', 'POST', {
-      url, mode, aspect, clip_method: g('vc-method').value, brand: curBrand() });
-    S.vmanifest = data.manifest;
-    vcRenderCards();
-    toast(`Analyzed (${data.elapsed}s) — tweak and render`);
-  } catch(e) { toast(e.message, 'err'); }
-  finally { S.busy = null; btn.disabled = false; btn.innerHTML = '🔎 Analyze'; }
-}
+    const data = await api(`/api/calendar?year=${year}&month=${month}` + (brand ? `&brand=${encodeURIComponent(brand)}` : ''));
+    S.cal = data;
+    // Every post the day cells and the schedule modal might need to read.
+    S.calItems = [].concat(...data.weeks.map(w => [].concat(...w.map(d => d.posts)))).concat(data.undated);
+    g('cal-label').textContent = data.label;
 
-function vcField(label, html) {
-  return `<div class="field-group" style="margin-bottom:8px;"><label>${label}</label>${html}</div>`;
-}
-
-function vcRenderCards() {
-  const m = S.vmanifest; if (!m) return;
-  const card = (c, i) => {
-    const t = c.text || {}, cr = c.crop || {};
-    let fields = '';
-    if (c.template === 'hook') {
-      fields = vcField('Lead', `<input class="url-inp" oninput="vcSet(${i},'text.lead',this.value)" value="${esc(t.lead||'')}">`)
-             + vcField('Body', `<textarea rows="2" oninput="vcSet(${i},'text.body',this.value)">${esc(t.body||'')}</textarea>`)
-             + vcField('Emoji', `<input class="url-inp" style="width:90px;" oninput="vcSet(${i},'text.emoji',this.value)" value="${esc(t.emoji||'')}">`);
-    } else if (c.template === 'title') {
-      fields = vcField('Title', `<input class="url-inp" oninput="vcSet(${i},'text.title',this.value)" value="${esc(t.title||'')}">`)
-             + vcField('Subtitle', `<input class="url-inp" oninput="vcSet(${i},'text.subtitle',this.value)" value="${esc(t.subtitle||'')}">`);
-    } else {
-      fields = vcField('CTA', `<textarea rows="2" oninput="vcSet(${i},'text.body',this.value)">${esc(t.body||'')}</textarea>`);
-    }
-    fields += vcField('Highlight words (comma)', `<input class="url-inp" oninput="vcSetHl(${i},this.value)" value="${esc((t.highlight||[]).join(', '))}">`);
-    return `<div class="story-card" style="cursor:default;">
-      <div class="s-top"><span class="score-pill badge badge-info">${esc(c.id)}</span></div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0;align-items:flex-end;">
-        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Start (s)</span>
-          <input type="number" step="0.5" min="0" class="url-inp" style="width:90px;" value="${(c.clip&&c.clip.start)||0}" oninput="vcSet(${i},'clip.start',parseFloat(this.value)||0)"></label>
-        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Length (s)</span>
-          <input type="number" step="0.5" min="0.5" class="url-inp" style="width:90px;" value="${(c.clip&&c.clip.duration)||4}" oninput="vcSet(${i},'clip.duration',parseFloat(this.value)||4)"></label>
-        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Framing</span>
-          <select class="src-sel" onchange="vcSet(${i},'crop.fit',this.value)">
-            <option value="fill" ${cr.fit!=='fit'?'selected':''}>Fill (crop)</option>
-            <option value="fit" ${cr.fit==='fit'?'selected':''}>Fit (letterbox)</option>
-          </select></label>
-        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Zoom</span>
-          <input type="number" step="0.05" min="1" max="3" class="url-inp" style="width:80px;" value="${cr.zoom||1}" oninput="vcSet(${i},'crop.zoom',parseFloat(this.value)||1)"></label>
-        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Focus ↕</span>
-          <input type="range" min="0" max="1" step="0.05" value="${cr.y!=null?cr.y:0.5}" oninput="vcSet(${i},'crop.y',parseFloat(this.value))"></label>
-      </div>
-      ${fields}
-    </div>`;
-  };
-  g('vc-body').innerHTML = `
-    ${m.cards.map((c,i)=>card(c,i)).join('')}
-    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
-      <button class="btn btn-primary" onclick="vcRender(false)">🎬 Render</button>
-      <button class="btn btn-green" onclick="vcRender(true)">✅ Render + Send to Postiz</button>
-    </div>
-    <div id="vc-preview" class="stories-list" style="gap:10px;flex-wrap:wrap;"></div>`;
-}
-
-function vcSet(i, path, val) {
-  const c = S.vmanifest && S.vmanifest.cards[i]; if (!c) return;
-  const parts = path.split('.');
-  if (parts.length === 2) { c[parts[0]] = c[parts[0]] || {}; c[parts[0]][parts[1]] = val; }
-  else c[path] = val;
-}
-function vcSetHl(i, val) {
-  S.vmanifest.cards[i].text.highlight = val.split(',').map(s=>s.trim()).filter(Boolean);
-}
-
-async function vcRender(send) {
-  const m = S.vmanifest; if (!m) { toast('Analyze first', 'err'); return; }
-  if (S.busy) { toast(`Wait — '${S.busy}' is running`, 'err'); return; }
-  const prev = g('vc-preview');
-  prev.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px;"><span class="spin"></span> Rendering… (downloads the video the first time)</div>';
-  S.busy = 'render video';
-  try {
-    const data = await api('/api/vreels/render', 'POST', { manifest: m, send });
-    prev.innerHTML = (data.assets_url||[]).map(u =>
-      `<video src="${u}?t=${Date.now()}" controls style="max-height:440px;border-radius:8px;border:1px solid var(--border);background:#000;"></video>`).join('');
-    if (send && data.postiz && data.postiz.post_id) toast('Rendered + sent to Postiz ✓ draft');
-    else if (send) toast('Rendered — Postiz returned no id', 'err');
-    else toast(`Rendered (${data.elapsed}s)`);
-  } catch(e) { prev.innerHTML = `<div style="color:var(--red);font-size:12px;padding:10px;">${esc(e.message)}</div>`; toast(e.message, 'err'); }
-  finally { S.busy = null; }
-}
-
-async function generateVideo() {
-  if (S.busy) { toast(`Wait — '${S.busy}' is still running`, 'err'); return; }
-  const url   = g('vid-url').value.trim();
-  const start = parseFloat(g('vid-start').value || '0');
-  const end   = parseFloat(g('vid-end').value || '0');
-  const rights = true;   // using the tool asserts your rights (gate kept server-side)
-  const sIdx  = g('vid-script').value;
-  const script = (sIdx !== '' && S.scripts[sIdx]) ? S.scripts[sIdx] : null;
-
-  if (!url) { toast('Paste a YouTube URL', 'err'); return; }
-  if (!(end > start)) { toast('End must be after start', 'err'); return; }
-  if (!rights) { toast('Tick the rights box to proceed', 'err'); return; }
-
-  const body = { youtube_url: url, start, end, rights_cleared: rights, script, brand: curBrand() };
-  const btn = g('btn-vid-gen');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Rendering…';
-  S.busy = 'generate video';
-  const res = g('video-result');
-  res.innerHTML = '<div style="color:var(--muted);font-size:13px;text-align:center;padding:40px;">⏬ Downloading clip &amp; compositing… this can take a minute.</div>';
-  const t0 = Date.now();
-  const tid = setInterval(() => { g('hdr-timer').textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's'; }, 200);
-  try {
-    const data = await api('/api/video/generate', 'POST', body);
-    g('hdr-timer').textContent = data.elapsed + 's';
-    const v = data.url + '?t=' + Date.now();
-    res.innerHTML = `
-      <div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:16px;">
-        <video src="${v}" controls playsinline style="max-height:64vh;width:auto;border-radius:12px;border:1px solid var(--border);background:#000;"></video>
-        <div style="display:flex;gap:10px;align-items:center;">
-          <span style="font-size:12px;color:var(--muted);">${esc(data.file)} · ${data.duration}s · 1080×1920</span>
-          <a class="btn btn-primary btn-sm" href="${data.url}" download>⬇ Download MP4</a>
-        </div>
+    grid.innerHTML = data.weeks.map(week => week.map(day => {
+      const chips = day.posts.map(p => {
+        const t = (p.scheduled_at || '').slice(11, 16);
+        const cls = p.status === 'published' ? 'published' : (p.status === 'failed' ? 'failed' : '');
+        return `<button class="cal-chip ${cls}" onclick="event.stopPropagation();calOpenPost('${p.id}')"
+          title="${esc((p.title || '') + ' · ' + (p.brand || '') + ' · ' + p.status)}">
+          <span class="t">${esc(t || '—')}</span><span class="n">${esc(p.title || 'post')}</span></button>`;
+      }).join('');
+      return `<div class="cal-day${day.in_month ? '' : ' out'}${day.today ? ' today' : ''}">
+        <div class="cal-daynum">${day.day}
+          <button class="cal-add" title="Schedule a post on this day" onclick="calAddOn('${day.date}')">＋</button></div>
+        <div class="cal-chips">${chips}</div>
       </div>`;
-    toast('Reel generated');
+    }).join('')).join('');
+
+    renderUnscheduled(data.undated);
+    calSchedulerStatus();
   } catch (e) {
-    res.innerHTML = `<div style="color:var(--red);font-size:13px;text-align:center;padding:30px;max-width:520px;margin:0 auto;line-height:1.5;">${esc(e.message || 'Failed')}</div>`;
+    grid.innerHTML = `<div style="grid-column:1/-1;color:var(--red);padding:24px;text-align:center;">${esc(e.message)}</div>`;
+  }
+}
+
+// The tray of approved-but-undated posts, so a day always has something to fill.
+function renderUnscheduled(items) {
+  const tray = g('cal-unsched');
+  if (!items || !items.length) { tray.style.display = 'none'; return; }
+  tray.style.display = '';
+  tray.innerHTML = `<span style="font-size:11px;color:var(--muted);font-weight:700;">UNSCHEDULED (${items.length})</span>`
+    + items.map(p => `<button class="cal-pill" onclick="openSchedule('${p.id}')" title="Click to schedule">
+        <span class="rv-status ${p.status || 'pending'}" style="font-size:9px;">${esc(p.status || '')}</span>
+        <span>${esc(p.title || 'post')}</span></button>`).join('');
+}
+
+function calOpenPost(id) {
+  const p = (S.calItems || []).find(x => x.id === id);
+  if (!p) return;
+  openModal(p.title || 'Post');
+  const imgs = (p.files || []).slice(0, 4).map(f =>
+    `<img src="/outputs/${p.rel}/${f}" style="height:120px;border-radius:6px;border:1px solid var(--border);">`).join('');
+  const pub = p.publish || {};
+  const err = pub.error || (pub.errors || []).map(e => e.platform + ': ' + e.error).join(' · ');
+  const done = p.status === 'published';
+  g('modal-body').innerHTML = `
+    <div style="display:flex;gap:6px;flex-wrap:wrap;">${imgs}</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+      <span class="rv-status ${p.status}">${esc(p.status)}</span>
+      <span style="font-size:11.5px;color:var(--muted);">${esc(p.brand || '')} · ${esc(p.format || '')}</span>
+      ${p.scheduled_at ? `<span class="rv-when">🗓 ${esc(fmtWhen(p.scheduled_at))}</span>` : ''}
+      ${(p.targets || []).length ? `<span style="font-size:11px;color:var(--muted);">→ ${esc(p.targets.join(' + '))}</span>` : ''}
+    </div>
+    <div class="rv-cap" style="margin-top:6px;">${esc(p.caption || '(no caption)')}</div>
+    ${err ? `<div style="font-size:12px;color:var(--red);margin-top:6px;">${esc(err)}</div>` : ''}
+    ${pub.permalink ? `<a href="${esc(pub.permalink)}" target="_blank" style="font-size:12px;color:var(--green);">View published post ↗</a>` : ''}
+    <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:12px;">
+      ${done ? '' : `<button class="btn btn-ghost btn-sm" onclick="closeModal();unschedule('${p.id}')">✕ Unschedule</button>
+      <button class="btn btn-primary btn-sm" onclick="openSchedule('${p.id}')">✎ Reschedule</button>
+      <button class="btn btn-green btn-sm" onclick="closeModal();publishNow('${p.id}')">🚀 Publish now</button>`}
+    </div>`;
+}
+
+// Clicking a day offers the unscheduled posts to drop into it.
+function calAddOn(dateStr) {
+  const pool = ((S.cal || {}).undated || []);
+  if (!pool.length) { toast('Nothing unscheduled — generate or approve some posts first'); return; }
+  openModal('Schedule on ' + dateStr);
+  g('modal-body').innerHTML = `
+    <div style="font-size:12.5px;color:var(--muted);">Pick a post to place on this day.</div>
+    <div style="display:flex;flex-direction:column;gap:7px;margin-top:8px;">
+      ${pool.map(p => `<button class="cal-pill" style="max-width:none;border-radius:8px;justify-content:flex-start;"
+        onclick="openSchedule('${p.id}', '${dateStr}T09:00')">
+        <span class="rv-status ${p.status || 'pending'}" style="font-size:9px;">${esc(p.status || '')}</span>
+        <span>${esc(p.title || 'post')}</span>
+        <span style="font-size:10.5px;color:var(--muted);margin-left:auto;">${esc(p.brand || '')}</span>
+      </button>`).join('')}
+    </div>`;
+}
+
+async function calAutofill() {
+  const brand = g('cal-brand') ? g('cal-brand').value : '';
+  try {
+    const r = await api('/api/calendar/autofill', 'POST', brand ? { brand } : {});
+    if (!r.scheduled) { toast('Nothing left to schedule'); return; }
+    toast(`Scheduled ${r.scheduled} post${r.scheduled === 1 ? '' : 's'}`
+      + (r.unplaced ? ` · ${r.unplaced} had no free slot` : ''));
+    loadCalendar();
+    updateBadges();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function calSchedulerStatus() {
+  const el = g('cal-sched-status'); if (!el) return;
+  try {
+    const s = await api('/api/scheduler/status');
+    const next = s.next ? ` · next ${fmtWhen(s.next)}` : '';
+    el.innerHTML = s.auto_publish
+      ? `<span style="color:var(--green);">● auto-publish on</span><span style="color:var(--muted);">${esc(next)}</span>`
+      : `<span style="color:var(--yellow);">‖ auto-publish off</span><span style="color:var(--muted);">${esc(next)}</span>`;
+  } catch (e) { el.textContent = ''; }
+}
+
+// Posting slots — the times auto-fill uses, saved back into config.yaml.
+async function calSettings() {
+  openModal('⚙ Posting slots');
+  const body = g('modal-body');
+  body.innerHTML = '<div style="color:var(--muted);font-size:12px;"><span class="spin"></span> Loading…</div>';
+  try {
+    const s = await api('/api/schedule/settings');
+    const dayBox = ['mon','tue','wed','thu','fri','sat','sun'].map(d =>
+      `<label class="tb-group" style="gap:5px;"><input type="checkbox" class="sl-day" value="${d}"
+        ${s.days.includes(d) ? 'checked' : ''}><span style="font-size:12.5px;text-transform:capitalize;">${d}</span></label>`).join('');
+    body.innerHTML = `
+      <div style="font-size:12.5px;color:var(--muted);line-height:1.6;">
+        Auto-fill drops queued posts into these times, on these days, in your local timezone.</div>
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;">Times (comma separated, HH:MM)</label>
+      <input id="sl-times" class="url-inp" style="width:100%;font-size:14px;padding:9px 11px;" value="${esc(s.times.join(', '))}">
+      <label style="font-size:12px;color:var(--muted);margin-top:10px;">Days</label>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;padding:4px 0;">${dayBox}</div>
+      <label class="tb-group" style="gap:7px;margin-top:8px;">
+        <input type="checkbox" id="sl-auto" ${s.auto_publish ? 'checked' : ''}>
+        <span style="font-size:13px;">Publish scheduled posts automatically</span></label>
+      <div style="font-size:11.5px;color:var(--muted);margin-top:2px;">Off = the calendar plans, but nothing is sent.</div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+        <button class="btn btn-ghost btn-sm" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary btn-sm" onclick="saveSlots()">Save</button>
+      </div>`;
+  } catch (e) { body.innerHTML = `<div style="color:var(--red);font-size:12px;">${esc(e.message)}</div>`; }
+}
+
+async function saveSlots() {
+  const times = g('sl-times').value.split(',').map(s => s.trim()).filter(Boolean);
+  const days = [...document.querySelectorAll('.sl-day:checked')].map(c => c.value);
+  try {
+    await api('/api/schedule/settings', 'PUT', { times, days, auto_publish: g('sl-auto').checked });
+    closeModal();
+    toast('Posting slots saved');
+    calSchedulerStatus();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// The calendar's brand filter mirrors the brands in the header dropdown.
+function syncCalBrands() {
+  const src = g('brand-sel'), dst = g('cal-brand');
+  if (!src || !dst) return;
+  const cur = dst.value;
+  dst.innerHTML = '<option value="">All brands</option>' +
+    [...src.options].map(o => `<option value="${esc(o.value)}">${esc(o.textContent)}</option>`).join('');
+  dst.value = cur;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CSV import — a content sheet becomes carousels (/api/csv/*)
+// ═══════════════════════════════════════════════════════════════════════════
+function initCsvDrop() {
+  const drop = g('csv-drop'); if (!drop || drop._init) return;
+  drop._init = true;
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', e => {
+    const f = e.dataTransfer.files[0];
+    if (f) csvUpload(f);
+  });
+}
+
+async function csvUpload(file) {
+  if (!file) return;
+  if (!/\.csv$/i.test(file.name)) { toast('Pick a .csv file', 'err'); return; }
+  const sum = g('csv-summary');
+  sum.innerHTML = '<div style="color:var(--muted);font-size:12.5px;"><span class="spin"></span> Reading…</div>';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/csv/preview', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Could not read that CSV');
+    S.csv = data;
+    renderCsvPreview(data);
+    g('csv-controls').style.display = '';
+  } catch (e) {
+    sum.innerHTML = `<div style="color:var(--red);font-size:12.5px;">${esc(e.message)}</div>`;
+    g('csv-controls').style.display = 'none';
+  }
+}
+
+function renderCsvPreview(d) {
+  const shape = d.shape === 'long' ? 'one row per slide' : 'one row per post';
+  const warn = d.unmapped.length
+    ? `<span class="badge badge-info" title="These columns are carried along but not used for slide copy">${d.unmapped.length} unused column${d.unmapped.length === 1 ? '' : 's'}</span>` : '';
+  g('csv-summary').innerHTML = `
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12.5px;">
+      <span class="badge badge-ok">✓ ${esc(d.filename || 'sheet')}</span>
+      <span style="color:var(--muted);">${d.row_count} rows · <b style="color:#fff;">${d.post_count} posts</b> · ${esc(shape)}</span>
+      ${warn}
+      <span style="color:var(--muted);">Mapped: ${esc(Object.keys(d.mapping).join(', ') || 'none')}</span>
+    </div>`;
+
+  const posts = d.posts.slice(0, 12);
+  g('csv-preview').innerHTML = `
+    <div style="font-size:12px;color:var(--muted);margin-bottom:7px;">Preview${d.posts.length > 12 ? ` (first 12 of ${d.posts.length})` : ''}</div>
+    <div class="csv-scroll" style="max-height:340px;">
+      <table class="csv-table">
+        <thead><tr><th>#</th><th>Title</th><th>Slides</th><th>Caption</th><th>Images</th><th>Schedule</th></tr></thead>
+        <tbody>${posts.map((p, i) => `<tr>
+          <td style="color:var(--muted);">${i + 1}</td>
+          <td style="color:#fff;">${esc(p.title || '—')}</td>
+          <td>${p.slides.length ? esc(p.slides.map(s => s.heading || s.body.slice(0, 18)).join(' · ')) : '<span style="color:var(--yellow);">brief only</span>'}</td>
+          <td>${esc((p.caption || '').slice(0, 60) || '—')}</td>
+          <td>${esc(p.image_query || '—')}</td>
+          <td>${esc(p.schedule || '—')}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
+function csvHelp() {
+  openModal('CSV columns');
+  g('modal-body').innerHTML = `
+    <div style="font-size:13px;line-height:1.65;">
+      <p style="margin-top:0;">Column names are matched loosely — case, spaces, and underscores
+      are ignored, and common aliases work (<code>headline</code> for <code>title</code>,
+      <code>tags</code> for <code>hashtags</code>, and so on).</p>
+      <p style="margin:0 0 6px;"><b>One row per post</b> (the usual shape):</p>
+      <code style="display:block;background:#0d1828;padding:9px 11px;border-radius:6px;white-space:pre;overflow-x:auto;font-size:11.5px;">title, subtitle, slide1_heading, slide1_body,
+slide2_heading, slide2_body, cta, caption,
+hashtags, image_query, schedule</code>
+      <p style="margin:10px 0 6px;"><b>One row per slide</b>, grouped by a post id:</p>
+      <code style="display:block;background:#0d1828;padding:9px 11px;border-radius:6px;white-space:pre;overflow-x:auto;font-size:11.5px;">post_id, order, heading, body, image_query</code>
+      <ul style="padding-left:18px;margin:12px 0 0;display:flex;flex-direction:column;gap:7px;font-size:12.5px;">
+        <li><b>Use my text as-is</b> renders exactly what the sheet says — no AI, no rewriting.</li>
+        <li><b>AI writes from each row</b> treats the row as a brief and runs the normal planner.
+          A <code>notes</code> or <code>body</code> column is the brief.</li>
+        <li><code>image_query</code> is the stock-photo search for that slide.</li>
+        <li><code>schedule</code> (e.g. <code>2026-09-03 09:00</code>) puts the post straight on
+          the calendar.</li>
+        <li><code>brand</code>, <code>format</code>, and <code>tone</code> columns override the
+          dropdowns for that row.</li>
+      </ul>
+      <div style="display:flex;justify-content:flex-end;margin-top:14px;">
+        <a class="btn btn-primary btn-sm" href="/api/csv/template" download>⬇ Download template</a>
+      </div>
+    </div>`;
+}
+
+async function csvGenerate() {
+  if (!S.csv) { toast('Upload a CSV first', 'err'); return; }
+  if (S.busy) { toast(`Wait — '${S.busy}' is running`, 'err'); return; }
+  const btn = g('csv-gen');
+  const out = g('csv-results');
+  const n = S.csv.post_count;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Generating…';
+  S.busy = 'csv import';
+  out.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:18px;text-align:center;">Building ${n} post${n === 1 ? '' : 's'}…</div>`;
+  try {
+    const data = await api('/api/csv/generate', 'POST', {
+      posts: S.csv.posts,
+      brand: curBrand(),
+      format: g('csv-format').value,
+      mode: g('csv-mode').value,
+      source: g('csv-source').value,
+      enqueue: g('csv-enqueue').checked,
+      autoschedule: g('csv-autoschedule').checked,
+      model: g('model-sel') ? g('model-sel').value : undefined,
+    });
+    const ok = data.results.filter(r => r.ok);
+    const bad = data.results.filter(r => !r.ok);
+    out.innerHTML = ok.map(r => `<div class="rv-card">
+        <div class="rv-imgs">${(r.files || []).slice(0, 4).map(f =>
+          `<a href="/outputs/${r.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${r.rel}/${f}?t=${Date.now()}"></a>`).join('')}</div>
+        <div class="rv-body">
+          <b style="color:#fff;font-size:13px;">${esc(r.title)}</b>
+          <span style="font-size:11px;color:var(--muted);">${esc(r.format)} · ${(r.files || []).length} slides${r.has_images ? '' : ' · no images'}</span>
+          <div class="rv-cap">${esc(r.caption || '')}</div>
+        </div></div>`).join('')
+      + bad.map(r => `<div class="rv-card" style="border-color:var(--red);">
+          <div class="rv-body"><b style="color:var(--red);font-size:13px;">${esc(r.title || 'row')}</b>
+          <div style="font-size:12px;color:var(--muted);">${esc(r.error || 'failed')}</div></div></div>`).join('');
+    toast(`${ok.length} post${ok.length === 1 ? '' : 's'} built in ${data.elapsed}s`
+      + (data.queued ? ` · ${data.queued} sent to Review` : '')
+      + (bad.length ? ` · ${bad.length} failed` : ''));
+    updateBadges();
+  } catch (e) {
+    out.innerHTML = `<div style="color:var(--red);font-size:13px;padding:14px;">${esc(e.message)}</div>`;
+    toast(e.message, 'err');
   } finally {
-    clearInterval(tid); btn.disabled = false; btn.innerHTML = '🎬 Generate reel'; S.busy = null;
+    btn.disabled = false; btn.innerHTML = '⚡ Generate posts'; S.busy = null;
   }
 }
 
@@ -4050,6 +5036,70 @@ function useSuggestion(btn) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Dashboard — four ready-to-handoff carousel packages
+async function loadDashboard() {
+  const host = g('dash-posts');
+  if (!host) return;
+  try {
+    const data = await api('/api/dashboard?brand=' + encodeURIComponent(curBrand()));
+    const counts = data.counts || {};
+    ['total','pending','scheduled','published'].forEach(k => {
+      const el = g('dash-' + k); if (el) el.textContent = counts[k] || 0;
+    });
+    const posts = data.posts || [];
+    const exportBtn = g('dash-export');
+    if (exportBtn) {
+      exportBtn.disabled = !posts.length;
+      exportBtn.textContent = posts.length ? `↓ Export all ${posts.length}` : '↓ Nothing to export';
+    }
+    if (!posts.length) {
+      host.innerHTML = `<div class="dash-empty"><strong>No carousel packages yet</strong>Create a post or generate from RSS. Finished posts will collect here automatically.<div style="margin-top:16px"><button class="btn btn-primary" onclick="showTab('create')">Create your first post</button></div></div>`;
+      return;
+    }
+    host.innerHTML = posts.map(dashboardPostCard).join('');
+  } catch (e) {
+    host.innerHTML = `<div class="dash-empty"><strong>Dashboard unavailable</strong>${esc(e.message)}</div>`;
+  }
+}
+
+function dashboardPostCard(it) {
+  const files = it.files || [];
+  const image = files[0] ? `/outputs/${it.rel}/${encodeURIComponent(files[0])}?t=${Date.now()}` : '';
+  const status = it.status || 'ready';
+  const when = it.scheduled_at
+    ? `Scheduled · ${fmtWhen(it.scheduled_at)}`
+    : (it.suggested_at ? `Suggested · ${fmtWhen(it.suggested_at)}` : 'Ready for your next available slot');
+  return `<article class="post-card">
+    <div class="post-cover">
+      ${image ? `<img src="${image}" alt="${esc(it.title || 'Carousel cover')}" loading="lazy">` : '<div class="dash-empty">No preview</div>'}
+      <span class="post-count">${files.length} slides</span>
+    </div>
+    <div class="post-body">
+      <div class="post-meta"><span class="post-brand">${esc(it.brand || 'brand')}</span><span class="rv-status ${esc(status)}">${esc(status)}</span></div>
+      <div class="post-title">${esc(it.title || 'Untitled carousel')}</div>
+      <div class="post-caption">${esc(it.caption || 'No caption supplied')}</div>
+      <div class="post-when">${esc(when)}</div>
+      <div class="post-actions">
+        <button class="btn btn-ghost" onclick="openDashboardPost('${it.id}','${status}')">Review</button>
+        <a class="btn btn-primary" href="/api/export/${it.id}" download>↓ Download</a>
+      </div>
+    </div>
+  </article>`;
+}
+
+function exportDashboard() {
+  const brand = encodeURIComponent(curBrand());
+  window.location.href = '/api/export-dashboard?brand=' + brand;
+  toast('Preparing carousel pack…');
+}
+
+function openDashboardPost(id, status) {
+  const filter = g('review-filter');
+  if (filter) filter.value = status || '';
+  showTab('review');
+  setTimeout(() => g('rv-' + id)?.scrollIntoView({behavior:'smooth', block:'center'}), 250);
+}
+
 // Review queue — approve (→ publish via n8n) / reject generated posts
 // ═══════════════════════════════════════════════════════════════════════════
 async function loadReview() {
@@ -4063,18 +5113,45 @@ async function loadReview() {
       host.innerHTML = '<div style="color:var(--muted);padding:32px;text-align:center;font-size:13px;">Nothing here. Generate posts in the 🤖 Agent tab or run autopilot.</div>';
       return;
     }
+    S.reviewItems = data.items;
     host.innerHTML = data.items.map(reviewCard).join('');
+    loadMetaStatus();
   } catch(e) { host.innerHTML = `<div style="color:var(--red);padding:20px;">${esc(e.message)}</div>`; }
 }
 function reviewCard(it) {
   const imgs = (it.files || []).map(f => `<a href="/outputs/${it.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${it.rel}/${f}?t=${Date.now()}"></a>`).join('');
   const st = it.status || 'pending';
-  const note = (it.publish && !it.publish.sent && st !== 'rejected')
-    ? `<span style="font-size:10px;color:var(--muted);align-self:center;">${esc(it.publish.reason || it.publish.error || '')}</span>` : '';
-  const actions = st === 'pending'
-    ? `<button class="btn btn-green btn-sm" onclick="approveReview('${it.id}',this)">✓ Approve &amp; publish</button>
-       <button class="btn btn-ghost btn-sm" onclick="rejectReview('${it.id}')">✕ Reject</button>`
-    : `<button class="btn btn-ghost btn-sm" onclick="delReview('${it.id}')">Delete</button>`;
+  const pub = it.publish || {};
+  // Show whatever the publisher last said — a Meta error is the useful part.
+  let note = '';
+  if (pub.error) note = `<span style="font-size:10.5px;color:var(--red);align-self:center;">${esc(pub.error)}</span>`;
+  else if ((pub.errors || []).length) note = `<span style="font-size:10.5px;color:var(--red);align-self:center;">${esc(pub.errors.map(e => e.platform + ': ' + e.error).join(' · '))}</span>`;
+  else if (pub.permalink) note = `<a href="${esc(pub.permalink)}" target="_blank" style="font-size:10.5px;color:var(--green);align-self:center;">View post ↗</a>`;
+  else if (pub.reason && st !== 'rejected') note = `<span style="font-size:10.5px;color:var(--muted);align-self:center;">${esc(pub.reason)}</span>`;
+
+  const when = it.scheduled_at
+    ? `<span class="rv-when">🗓 ${esc(fmtWhen(it.scheduled_at))}</span>` : '';
+  const targets = (it.targets && it.targets.length) ? it.targets : null;
+  const tgt = targets ? `<span style="font-size:10.5px;color:var(--muted);">→ ${esc(targets.join(' + '))}</span>` : '';
+
+  let actions;
+  if (st === 'pending') {
+    actions = `<button class="btn btn-green btn-sm" onclick="approveReview('${it.id}',this)">✓ Approve</button>
+       <button class="btn btn-primary btn-sm" onclick="openSchedule('${it.id}')">🗓 Schedule</button>
+       <button class="btn btn-ghost btn-sm" onclick="publishNow('${it.id}',this)">🚀 Publish now</button>
+       <button class="btn btn-ghost btn-sm" onclick="rejectReview('${it.id}')">✕ Reject</button>`;
+  } else if (st === 'approved' || st === 'failed') {
+    actions = `<button class="btn btn-primary btn-sm" onclick="openSchedule('${it.id}')">🗓 Schedule</button>
+       <button class="btn btn-green btn-sm" onclick="publishNow('${it.id}',this)">🚀 Publish now</button>
+       <button class="btn btn-ghost btn-sm" onclick="delReview('${it.id}')">Delete</button>`;
+  } else if (st === 'scheduled') {
+    actions = `<button class="btn btn-ghost btn-sm" onclick="openSchedule('${it.id}')">✎ Reschedule</button>
+       <button class="btn btn-ghost btn-sm" onclick="unschedule('${it.id}')">✕ Unschedule</button>
+       <button class="btn btn-green btn-sm" onclick="publishNow('${it.id}',this)">🚀 Publish now</button>`;
+  } else {
+    actions = `<button class="btn btn-ghost btn-sm" onclick="delReview('${it.id}')">Delete</button>`;
+  }
+
   return `<div class="rv-card" id="rv-${it.id}">
     <div class="rv-imgs">${imgs}</div>
     <div class="rv-body">
@@ -4082,48 +5159,262 @@ function reviewCard(it) {
         <span class="rv-status ${st}">${esc(st)}</span>
         <b style="color:#fff;font-size:13px;">${esc(it.title || '')}</b>
         <span style="font-size:11px;color:var(--muted);">${esc(it.brand || '')} · ${esc(it.format || '')}</span>
+        ${when}${tgt}
       </div>
       <div class="rv-cap">${esc(it.caption || '(no caption)')}</div>
-      <div class="rv-actions">${actions}${note}</div>
+      ${blockedNote(it)}
+      <div class="rv-actions">${actions}<a class="btn btn-primary btn-sm" href="/api/export/${it.id}" download>↓ Export ZIP</a>${note}</div>
     </div></div>`;
 }
-// In-app quick tutorial for connecting Instagram and adding more channels.
+
+// "2026-08-27T18:30:00" -> "Thu 27 Aug, 18:30" (local, matching the calendar).
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString(undefined, { weekday: 'short', day: 'numeric',
+    month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+// datetime-local wants "YYYY-MM-DDTHH:MM" in local time, not a UTC ISO string.
+function toLocalInput(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Publishing readiness, shown in the Review toolbar so a missing token or
+// PUBLIC_BASE_URL is visible before you approve twenty posts.
+async function loadMetaStatus() {
+  const el = g('meta-status'); if (!el) return;
+  try {
+    const s = await api('/api/meta/status');
+    S.meta = s;
+    if (!s.configured) {
+      el.innerHTML = `<span class="badge badge-err" title="Set META_ACCESS_TOKEN in .env">⚠ Not connected</span>`;
+    } else if (!s.public_base_url) {
+      el.innerHTML = `<span class="badge badge-err" title="Instagram needs PUBLIC_BASE_URL — Meta fetches the images from your machine">⚠ No public URL</span>`;
+    } else {
+      const n = (s.accounts || []).filter(a => a.token_set).length;
+      el.innerHTML = `<span class="badge badge-ok" title="Publishing directly via the Meta Graph API">● Connected (${n})</span>`;
+    }
+  } catch (e) { el.innerHTML = ''; }
+}
+
+// In-app tutorial for connecting Instagram / Facebook with your own Meta app.
 function showChannelHelp() {
-  openModal('Connect Instagram & add channels');
+  openModal('Connect Instagram & Facebook');
+  const s = S.meta || {};
+  const rows = (s.accounts || []).map(a =>
+    `<li><b>${esc(a.brand)}</b> — IG ${a.instagram ? '✓' : '—'} · FB ${a.facebook ? '✓' : '—'} ·
+      token ${a.token_set ? '✓' : '<span style="color:var(--red);">missing</span>'}</li>`).join('');
   g('modal-body').innerHTML = `
     <div style="font-size:13px;line-height:1.65;">
-      <p style="margin-top:0;">This app publishes through <b>Postiz</b>. K2 needs just one secret —
-      your Postiz <b>Public API key</b> in <code>.env</code> (<code>POSTIZ_API_KEY</code>).
-      Every channel is connected <i>inside Postiz</i>, then mapped to a brand here.</p>
+      <p style="margin-top:0;">This app publishes <b>directly through the Meta Graph API</b> with
+      your own credentials — no third-party scheduler in between.</p>
       <ol style="padding-left:18px;display:flex;flex-direction:column;gap:9px;margin:0;">
-        <li><b>Connect a channel in Postiz</b> → <i>Add Channel</i> → Instagram (or Facebook /
-          LinkedIn / X / TikTok / YouTube…). Instagram must be Business/Creator, and OAuth
-          needs a public <b>HTTPS</b> URL (not <code>localhost</code>).</li>
-        <li><b>Get its id:</b> run <code>python postiz.py --list-channels</code> — each channel
-          prints an id, a name, and its platform.</li>
-        <li><b>Map it to a brand</b> in <code>config.yaml</code> under <code>postiz.channels</code>:
-          <code style="display:block;background:#0d1828;padding:8px 10px;border-radius:6px;margin-top:5px;white-space:pre;">channels:
-  brand_a: "cmqy696...id"
-  brand_b: "cmqy69v...id"</code></li>
-        <li><b>Restart K2.</b> Approving a post now routes it to the channel mapped to that
-          post's brand (the Brand selector up top). Repeat for as many channels/brands as you like.</li>
+        <li><b>Instagram must be a Business or Creator account</b>, linked to a Facebook Page
+          (Instagram app → Settings → Account type).</li>
+        <li><b>Create a Meta app</b> at <code>developers.facebook.com</code> and add the
+          <i>Instagram Graph API</i> product.</li>
+        <li><b>Get a token</b> in the Graph API Explorer with these scopes:
+          <code style="display:block;background:#0d1828;padding:8px 10px;border-radius:6px;margin-top:5px;white-space:pre-wrap;">instagram_basic, instagram_content_publish,
+pages_show_list, pages_read_engagement, pages_manage_posts</code>
+          Make it long-lived: <code>python meta.py --exchange-token &lt;token&gt;</code>,
+          then put it in <code>.env</code> as <code>META_ACCESS_TOKEN</code>.</li>
+        <li><b>App id + secret</b> in <code>.env</code> — the exchange above needs them.
+          A Meta app shows two different pairs, so copy the one matching your login flow:
+          <code style="display:block;background:#0d1828;padding:8px 10px;border-radius:6px;margin-top:5px;white-space:pre;">META_APP_ID / META_APP_SECRET            # App settings &gt; Basic
+INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET  # Instagram &gt; API setup</code>
+          Instagram-login tokens exchange with
+          <code>python meta.py --exchange-ig-token &lt;token&gt;</code> and extend with
+          <code>--refresh-ig-token</code> (do it before day 60).</li>
+        <li><b>Map each brand</b> in <code>config.yaml</code> → <code>meta.accounts</code>:
+          <code style="display:block;background:#0d1828;padding:8px 10px;border-radius:6px;margin-top:5px;white-space:pre;">accounts:
+  brand_a:
+    ig_user_id: "17841400000000000"
+    fb_page_id: "1234567890"
+    targets: ["instagram", "facebook"]</code></li>
+        <li><b>Set <code>PUBLIC_BASE_URL</code></b> in <code>.env</code> to a public https address that
+          serves this app's <code>/outputs</code> folder. Instagram fetches the rendered images
+          itself, so <code>localhost</code> can never work. Facebook does not need this.</li>
+        <li><b>Restart</b>, then hit <b>Check connection</b> below.</li>
       </ol>
+      ${rows ? `<p style="margin-bottom:4px;"><b>Configured accounts</b></p><ul style="padding-left:18px;margin:0;font-size:12.5px;">${rows}</ul>` : ''}
+      <p style="font-size:12px;color:var(--muted);">Public URL:
+        <code>${esc(s.public_base_url || 'not set')}</code><br>App credentials:
+        <code>META_APP_*</code> ${s.app_credentials?.facebook_app ? '✓' : '—'} ·
+        <code>INSTAGRAM_APP_*</code> ${s.app_credentials?.instagram_app ? '✓' : '—'}</p>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-sm" onclick="runPreflight()">🧪 Run preflight</button>
+        <button class="btn btn-primary btn-sm" onclick="verifyMeta()">🔌 Check connection</button>
+      </div>
+      <div id="meta-verify" style="font-size:12px;"></div>
       <p style="color:var(--muted);font-size:12px;margin-bottom:0;">Full guide:
         <code>docs/PUBLISHING_AND_CHANNELS.md</code></p>
     </div>`;
 }
 
+// A scheduled post that could not go out keeps its slot and records why. Say so
+// on the card — an unexplained "scheduled" in the past is what sent the user
+// looking through logs in the first place.
+function blockedNote(it) {
+  const reason = it.blocked_reason || ((it.publish || {}).reason || '');
+  if (!reason || it.status === 'published') return '';
+  const since = it.blocked_since ? ` since ${esc(fmtWhen(it.blocked_since))}` : '';
+  return `<div class="rv-blocked" title="${esc(reason)}">⚠ Not published${since} — ${esc(reason)}
+    <a href="#" onclick="event.preventDefault();runPreflight('${esc(it.id)}');showChannelHelp();">check</a></div>`;
+}
+
+async function verifyMeta() {
+  const out = g('meta-verify');
+  out.innerHTML = '<div style="color:var(--muted);padding:8px 0;"><span class="spin"></span> Asking Meta…</div>';
+  try {
+    const r = await api('/api/meta/verify', 'POST', {});
+    const rows = (r.accounts || []).map(a => {
+      if (!a.ok) return `<div style="color:var(--red);padding:4px 0;">✕ <b>${esc(a.brand)}</b> — ${esc(a.error || '')}</div>`;
+      const ig = a.instagram ? `IG @${esc(a.instagram.username || '?')}` : 'no IG';
+      const fb = a.facebook ? ` · FB ${esc(a.facebook.name || '?')}` : '';
+      const q = a.quota ? ` · ${a.quota.remaining}/${a.quota.total} posts left today` : '';
+      return `<div style="color:var(--green);padding:4px 0;">✓ <b>${esc(a.brand)}</b> — ${ig}${fb}${q}
+        <span style="color:var(--muted);">· token expires ${esc(a.token_expires || '?')}</span></div>`;
+    }).join('');
+    out.innerHTML = (r.warning ? `<div style="color:var(--yellow);padding:4px 0;">⚠ ${esc(r.warning)}</div>` : '') + rows;
+    loadMetaStatus();
+  } catch (e) { out.innerHTML = `<div style="color:var(--red);padding:6px 0;">${esc(e.message)}</div>`; }
+}
+
+// Preflight: every publishing constraint, checked and listed. Answers "why is
+// this post not going out" without having to read the server log.
+async function runPreflight(id) {
+  const out = g('meta-verify');
+  if (!out) return;
+  out.innerHTML = '<div style="color:var(--muted);padding:8px 0;"><span class="spin"></span> Checking…</div>';
+  try {
+    const body = id ? { id } : { brand: (S.brand || '') };
+    const r = await api('/api/meta/preflight', 'POST', body);
+    const rows = (r.checks || []).map(c => {
+      if (c.ok) return `<div style="color:var(--muted);padding:2px 0;">✓ ${esc(c.name)}</div>`;
+      const color = c.level === 'warn' ? 'var(--yellow)' : 'var(--red)';
+      const mark = c.level === 'warn' ? '⚠' : '✕';
+      return `<div style="color:${color};padding:3px 0;">${mark} <b>${esc(c.name)}</b> — ${esc(c.detail)}</div>`;
+    }).join('');
+    const head = r.ok
+      ? '<div style="color:var(--green);padding:4px 0;"><b>Ready to publish.</b></div>'
+      : `<div style="color:var(--red);padding:4px 0;"><b>Blocked</b> — ${(r.blocking || []).length} check(s) must pass first.</div>`;
+    out.innerHTML = head + rows;
+  } catch (e) { out.innerHTML = `<div style="color:var(--red);padding:6px 0;">${esc(e.message)}</div>`; }
+}
+
+// ── Scheduling from the Review tab ────────────────────────────────────────────
+async function openSchedule(id, presetISO) {
+  const items = (S.reviewItems || []).concat(S.calItems || []);
+  const it = items.find(x => x.id === id) || {};
+  const acct = ((S.meta || {}).accounts || []).find(a => a.brand === it.brand);
+  const def = it.targets || (acct && acct.targets) || ['instagram'];
+  const start = presetISO ? new Date(presetISO)
+    : (it.scheduled_at ? new Date(it.scheduled_at) : new Date(Date.now() + 3600e3));
+
+  openModal('🗓 Schedule post');
+  g('modal-body').innerHTML = `
+    <div style="font-size:13px;line-height:1.6;">
+      <b style="color:#fff;">${esc(it.title || 'post')}</b>
+      <span style="font-size:11px;color:var(--muted);"> · ${esc(it.brand || '')} · ${esc(it.format || '')}</span>
+    </div>
+    <label style="font-size:12px;color:var(--muted);margin-top:8px;">When (your local time)</label>
+    <input type="datetime-local" id="sch-when" class="url-inp" value="${toLocalInput(start)}"
+      style="width:100%;font-size:14px;padding:9px 11px;">
+    <label style="font-size:12px;color:var(--muted);margin-top:10px;">Publish to</label>
+    <div style="display:flex;gap:14px;padding:4px 0;">
+      <label class="tb-group" style="gap:6px;"><input type="checkbox" id="sch-ig" ${def.includes('instagram') ? 'checked' : ''}><span style="font-size:13px;">Instagram</span></label>
+      <label class="tb-group" style="gap:6px;"><input type="checkbox" id="sch-fb" ${def.includes('facebook') ? 'checked' : ''}><span style="font-size:13px;">Facebook Page</span></label>
+    </div>
+    <div id="sch-quick" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px;"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="saveSchedule('${id}')">🗓 Schedule</button>
+    </div>`;
+
+  // Offer the next few configured posting slots as one-click choices.
+  try {
+    const s = await api('/api/schedule/settings');
+    const chips = (s.times || []).map(t => {
+      const d = new Date(start); const [hh, mm] = t.split(':');
+      d.setHours(+hh, +mm, 0, 0);
+      if (d < new Date()) d.setDate(d.getDate() + 1);
+      return `<button class="btn btn-ghost btn-sm" onclick="g('sch-when').value='${toLocalInput(d)}'">${esc(t)}</button>`;
+    }).join('');
+    if (chips) g('sch-quick').innerHTML =
+      `<span style="font-size:11px;color:var(--muted);align-self:center;">Slots:</span>${chips}`;
+  } catch (e) {}
+}
+
+async function saveSchedule(id) {
+  const when = g('sch-when').value;
+  if (!when) { toast('Pick a date and time', 'err'); return; }
+  const targets = [];
+  if (g('sch-ig').checked) targets.push('instagram');
+  if (g('sch-fb').checked) targets.push('facebook');
+  if (!targets.length) { toast('Pick at least one destination', 'err'); return; }
+  try {
+    await api('/api/calendar/schedule', 'POST', { id, when, targets });
+    closeModal();
+    toast('Scheduled for ' + fmtWhen(when));
+    refreshQueueViews();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function unschedule(id) {
+  try {
+    await api('/api/calendar/unschedule', 'POST', { id });
+    toast('Removed from the calendar');
+    refreshQueueViews();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function publishNow(id, btn) {
+  if (!confirm('Publish this post now?')) return;
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>'; }
+  try {
+    const r = await api('/api/review/' + id + '/publish', 'POST', {});
+    const p = r.publish || {};
+    if (p.sent) toast('Published ✓' + (p.permalink ? ' — live on Meta' : ''));
+    else toast(p.error || (p.errors || [])[0]?.error || p.reason || 'Not published', 'err');
+    refreshQueueViews();
+  } catch (e) {
+    toast(e.message, 'err');
+    if (btn) { btn.disabled = false; btn.innerHTML = '🚀 Publish now'; }
+  }
+}
+
+// Review and Calendar read the same queue, so one action refreshes both.
+function refreshQueueViews() {
+  if (g('tab-review') && g('tab-review').classList.contains('active')) loadReview();
+  if (g('tab-calendar') && g('tab-calendar').classList.contains('active')) loadCalendar();
+  updateBadges();
+}
+
+async function updateBadges() {
+  try {
+    const data = await api('/api/review');
+    updateReviewBadge(data.items.filter(i => i.status === 'pending').length);
+    const n = data.items.filter(i => i.status === 'scheduled').length;
+    const b = g('cal-badge');
+    if (b) { b.textContent = n; b.style.display = n ? '' : 'none'; }
+  } catch (e) {}
+}
+
 async function approveReview(id, btn) {
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
   try {
-    const r = await api('/api/review/' + id + '/approve', 'POST');
-    if (r.publish && r.publish.sent) toast('Published ✓ ' + (r.publish.via === 'postiz' ? 'draft in Postiz' : ''));
-    else if (r.publish && r.publish.reason) toast('Approved — set POSTIZ_API_KEY to auto-draft');
-    else if (r.publish && r.publish.error) toast('Approved, publish failed: ' + r.publish.error, 'err');
-    else toast('Approved');
+    const r = await api('/api/review/' + id + '/approve', 'POST', {});
+    const p = r.publish || {};
+    if (p.sent) toast('Approved & published ✓');
+    else toast('Approved — schedule it on the calendar or publish now');
     loadReview();
-  } catch(e) { toast(e.message, 'err'); btn.disabled = false; btn.innerHTML = '✓ Approve & publish'; }
+    updateBadges();
+  } catch(e) { toast(e.message, 'err'); btn.disabled = false; btn.innerHTML = '✓ Approve'; }
 }
+
 async function rejectReview(id) { await api('/api/review/' + id + '/reject', 'POST').catch(() => {}); loadReview(); }
 async function delReview(id)    { await api('/api/review/' + id, 'DELETE').catch(() => {}); loadReview(); }
 async function clearReview()    { if (!confirm('Remove all rejected entries?')) return; await api('/api/review/clear', 'POST', { status: 'rejected' }).catch(() => {}); loadReview(); }
@@ -4133,6 +5424,7 @@ function updateReviewBadge(n) {
 }
 async function refreshReviewBadge() {
   try { const d = await api('/api/review?status=pending'); updateReviewBadge(d.pending); } catch(e) {}
+  updateBadges();
 }
 
 function refreshResponsiveSurfaces() {
@@ -4373,7 +5665,8 @@ function reviewBadgeHtml(rel) {
   const st = rel && S.reviewIndex[rel];
   if (!st) return '';
   const icons = { pending: '📋 Pending Review', approved: '✅ Approved',
-                 published: '📤 Sent to Postiz', rejected: '✕ Rejected' };
+                 scheduled: '🗓 Scheduled', published: '📤 Published',
+                 failed: '⚠ Failed', rejected: '✕ Rejected' };
   return `<span class="rv-status ${esc(st)}" style="margin-left:auto;">${icons[st] || esc(st)}</span>`;
 }
 
@@ -4398,7 +5691,7 @@ function resultCard(ri) {
       </div>
       <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption||'')}</div>
       <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
-        ${isCarousel ? `<button class="btn btn-primary btn-sm" onclick="editResultPlan(${ri})">✎ Edit in Editor</button>`
+        ${isCarousel ? `<span class="rv-status approved">Ready package</span>`
                      : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
         <button class="btn btn-green btn-sm" onclick="sendResultToReview(${ri}, this)">✓ Send to Review</button>
         <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
@@ -4721,9 +6014,9 @@ async function useStor(i) {
       return;
     }
     loadPlan(data.plan);
-    showTab('editor', document.querySelectorAll('.nav-btn')[2]);
-    toast(`Plan ready (${data.elapsed}s)`);
-    notify('Plan ready', `${(data.plan.title_card&&data.plan.title_card.headline)||s.title.slice(0,60)} · ${data.elapsed}s`);
+    await finishPlanAutomatically(g('batch-src')?.value || 'pexels', true);
+    toast(`Carousel ready (${data.elapsed}s)`);
+    notify('Carousel ready', `${(data.plan.title_card&&data.plan.title_card.headline)||s.title.slice(0,60)} · ${data.elapsed}s`);
   } catch(e) {
     toast(e.message,'err');
   } finally {
@@ -4759,7 +6052,7 @@ async function clearEditorSession() {
 
 async function clearCreateSession() {
   if (S.busy) { toast(`Wait - '${S.busy}' is still running`, 'err'); return; }
-  if (!confirm('Start fresh for this brand? This clears the current Create, Editor, fetched stories and generated-result session. Library items and rendered outputs will stay.')) return;
+  if (!confirm('Start fresh for this brand? This clears the current draft, fetched stories and generated-result session. Library items and rendered outputs will stay.')) return;
   try {
     await api('/api/session/clear', 'POST', {scope:'all'});
     resetEditorView();
@@ -5214,17 +6507,47 @@ async function manualGenerate(){
     });
     clearInterval(tid); const h=g('hdr-timer'); if(h) h.textContent=data.elapsed+'s';
     loadPlan(data.plan);
+    btn.innerHTML='<span class="spin"></span> Finding images…';
+    try {
+      const fetched = await api('/api/images/fetch','POST',{source:'pexels'});
+      S.imagePaths = fetched.image_paths || {};
+    } catch (imageError) { /* render still works with uploaded or empty backgrounds */ }
     // assign pooled images to the content slides, in order
     const imgs = S.manualImages || [];
     for(let i=0;i<imgs.length;i++){
       try { await _setSlideImageFromBlob(i, imgs[i], imgs[i].name||`manual-${i}.png`); } catch(err){}
     }
     S.manualImages = []; renderManualImages();
-    showTab('editor');
-    toast(`Post generated (${data.elapsed}s) — refine, then Render`);
+    btn.innerHTML='<span class="spin"></span> Rendering package…';
+    await finishPlanAutomatically('pexels', false);
+    toast(`Post package ready (${data.elapsed}s)`);
     notify('Post generated', (data.plan.title_card&&data.plan.title_card.headline)||idea.slice(0,60));
   } catch(e){ clearInterval(tid); toast(e.message,'err'); }
   finally { btn.disabled=false; btn.innerHTML=lbl; }
+}
+
+async function finishPlanAutomatically(source='pexels', fetchBackgrounds=true) {
+  if (!S.plan) throw new Error('No generated plan is available.');
+  if (fetchBackgrounds) {
+    try {
+      const images = await api('/api/images/fetch','POST',{source});
+      S.imagePaths = images.image_paths || {};
+    } catch (e) { /* rendering without a background is still a valid fallback */ }
+  }
+  const rendered = await api('/api/render','POST',{brand:curBrand()});
+  S.lastRender = {rel:rendered.rel, files:rendered.files};
+  const p = S.plan;
+  await api('/api/review/enqueue','POST',{
+    brand:curBrand(),
+    title:(p.title_card && p.title_card.headline) || p.slug || 'Untitled',
+    format:p.format || 'carousel',
+    rel:rendered.rel,
+    files:rendered.files,
+    caption:p.caption || '',
+  });
+  await loadDashboard();
+  showTab('dashboard');
+  return rendered;
 }
 
 // Copy a field's text to the clipboard. mode '#' formats CSV tags as "#a #b".
@@ -5411,7 +6734,7 @@ async function renderFull() {
   }
 }
 
-// Push the just-rendered Editor carousel into the Review queue (→ approve → Postiz).
+// Push the just-rendered Editor carousel into the Review queue (→ approve → publish).
 async function sendEditorToReview(btn) {
   if (!S.plan || !S.lastRender) { toast('Render a carousel first','err'); return; }
   if (btn) { btn.disabled=true; btn.innerHTML='<span class="spin"></span>'; }
@@ -6023,10 +7346,11 @@ async function loadSavedPlan(id) {
     Object.entries(S.imagePaths).forEach(([i,p]) => {
       if (p) setThumb(parseInt(i), '/image_cache/' + p.split(/[/\\]/).pop());
     });
-    closeModal();
-    showTab('editor', document.querySelectorAll('.nav-btn')[2]);
     const n = Object.keys(S.imagePaths).length;
-    toast('Plan loaded' + (n ? ` (caption + ${n} image${n>1?'s':''})` : ''));
+    closeModal();
+    toast('Rendering saved plan…');
+    await finishPlanAutomatically('pexels', !n);
+    toast('Saved plan rendered and added to Dashboard');
   } catch(e){ toast(e.message,'err'); }
 }
 async function delSavedPlan(id, btn) {
@@ -6133,7 +7457,7 @@ function renderLibrary() {
   if (!items.length) {
     list.innerHTML = `<div style="color:var(--muted);font-size:13px;text-align:center;padding:40px;line-height:1.6;">
       <div style="font-size:30px;margin-bottom:8px;">📚</div>No saved ${kind === 'plans' ? 'plans' : 'story sets'} yet.<br>
-      ${kind === 'plans' ? 'Save a post from the Editor (💾) to see it here.' : 'Save a fetched set from Stories (💾 Save set).'}</div>`;
+      ${kind === 'plans' ? 'Saved generated plans will appear here.' : 'Save a fetched set from Stories (💾 Save set).'}</div>`;
     return;
   }
   const grid = S.lib.view === 'grid';
@@ -6174,8 +7498,10 @@ async function libLoad(id) {
     if (S.lib.kind === 'plans') {
       const data = await api('/api/library/plan/' + id);
       loadPlan(data.plan);
-      showTab('editor');
-      toast('Plan loaded');
+      S.imagePaths = data.image_paths || {};
+      toast('Rendering saved plan…');
+      await finishPlanAutomatically('pexels', !Object.keys(S.imagePaths).length);
+      toast('Saved plan rendered and added to Dashboard');
     } else {
       const data = await api('/api/library/stories/' + id);
       S.stories = data.stories || [];
